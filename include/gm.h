@@ -365,18 +365,43 @@ int      gm_send_blit_half(gm_handle *h, uint32_t frame_id, uint16_t vsync,
  * the life of the session: a receiver that changes address mid-game
  * requires a restart.
  *
- * gm_init returns NULL for any of these causes:
- *   - receiver_ip is NULL;
- *   - Winsock initialization failed (Windows only);
- *   - the handle allocation failed;
- *   - the socket could not be opened, or receiver_ip failed to resolve;
- *   - the socket already holds, at open time, a send segment shorter than
- *     the default MTU (Windows only): a handle that would already come out
- *     pre-split is never handed back to the caller.
+ * gm_init returns NULL for any of these six causes, each with its code;
+ * gm_last_init_error() returns that code on the calling thread:
+ *   - GM_INIT_ERR_NO_ADDRESS    receiver_ip is NULL;
+ *   - GM_INIT_ERR_WINSOCK       Winsock initialization failed (Windows only);
+ *   - GM_INIT_ERR_ALLOC         the handle allocation failed;
+ *   - GM_INIT_ERR_SOCKET        the socket could not be opened;
+ *   - GM_INIT_ERR_RESOLVE       receiver_ip failed to resolve;
+ *   - GM_INIT_ERR_SEND_SEGMENT  the socket already holds, at open time, a
+ *                               send segment shorter than the default MTU
+ *                               (Windows only): a handle that would already
+ *                               come out pre-split is never handed back to
+ *                               the caller.
+ * After a successful gm_init, gm_last_init_error() returns GM_INIT_OK.
  * port = 32100 default.
  * gm_recv_status: timeout_ms == 0 → non-blocking poll.
  * ------------------------------------------------------------------------- */
 gm_handle *gm_init(const char *receiver_ip, uint16_t port);
+
+/* Cause codes for gm_init, read back through gm_last_init_error(). Plain
+ * integers, same style as GM_SEND_ERR_*. */
+#define GM_INIT_OK                0
+#define GM_INIT_ERR_NO_ADDRESS    1
+#define GM_INIT_ERR_WINSOCK       2
+#define GM_INIT_ERR_ALLOC         3
+#define GM_INIT_ERR_SOCKET        4
+#define GM_INIT_ERR_RESOLVE       5
+#define GM_INIT_ERR_SEND_SEGMENT  6
+
+/* Cause of the last gm_init call made on the CALLING thread: one of the
+ * GM_INIT_* codes above, GM_INIT_OK after a success (a stale cause never
+ * outlives the next call). Another thread's gm_init does not change it.
+ * GM_INIT_OK as well if this thread never called gm_init. */
+int gm_last_init_error(void);
+
+/* Human-readable text for a GM_INIT_* code: a static English string, never
+ * NULL; "unknown error" for any other value. */
+const char *gm_init_error_str(int code);
 
 /* Maximum size of a PAYLOAD datagram, for this session.
  * All three chunkers honor it: gm_send_blit, gm_send_blit_field,

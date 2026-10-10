@@ -99,15 +99,114 @@ static const char *gm_sndbuf_text(const gm_handle *h, char *buf, size_t cap)
     return buf;
 }
 
+/* Cause of the last gm_init on the calling thread (GM_INIT_* in gm.h).
+ * Thread-local: there is no handle to hang it on when gm_init returns NULL,
+ * and a process-wide variable would let one thread read another thread's
+ * cause. gm_init sets it on EVERY exit, success included, so a stale cause
+ * never outlives the next call.
+ *
+ * Windows uses the Win32 TLS API, not _Thread_local: MinGW compiles
+ * _Thread_local to emulated TLS, which makes libgm.dll import
+ * __emutls_get_address from libgcc_s_seh-1.dll -- a runtime DLL its callers
+ * do not ship, so the library would fail to load. The slot is allocated on
+ * first use and kept for the life of the process; a fresh slot reads NULL,
+ * i.e. GM_INIT_OK, on every thread. Should Windows run out of TLS slots,
+ * the cause falls back to a process-wide value rather than being lost. */
+#ifdef _WIN32
+static volatile LONG s_init_error_slot = (LONG)TLS_OUT_OF_INDEXES;
+static volatile LONG s_init_error_fallback = GM_INIT_OK;
+
+static DWORD gm_init_error_slot(void)
+{
+    LONG cur = s_init_error_slot;
+    if (cur != (LONG)TLS_OUT_OF_INDEXES) return (DWORD)cur;
+    DWORD mine = TlsAlloc();
+    if (mine == TLS_OUT_OF_INDEXES) return TLS_OUT_OF_INDEXES;
+    LONG prev = InterlockedCompareExchange(&s_init_error_slot, (LONG)mine,
+                                           (LONG)TLS_OUT_OF_INDEXES);
+    if (prev != (LONG)TLS_OUT_OF_INDEXES) {   /* another thread won the race */
+        TlsFree(mine);
+        return (DWORD)prev;
+    }
+    return mine;
+}
+
+static void gm_init_error_set(int code)
+{
+    DWORD slot = gm_init_error_slot();
+    if (slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(slot, (LPVOID)(intptr_t)code);
+    else
+        InterlockedExchange(&s_init_error_fallback, (LONG)code);
+}
+
+int gm_last_init_error(void)
+{
+    /* TlsGetValue resets the thread's last-error code: keep the caller's
+     * (WSAGetLastError reads the same value) intact across this call. */
+    DWORD saved = GetLastError();
+    DWORD slot  = gm_init_error_slot();
+    int   code;
+    if (slot == TLS_OUT_OF_INDEXES)
+        code = (int)s_init_error_fallback;
+    else
+        code = (int)(intptr_t)TlsGetValue(slot);
+    SetLastError(saved);
+    return code;
+}
+#else
+static _Thread_local int s_init_error = GM_INIT_OK;
+
+static void gm_init_error_set(int code)
+{
+    s_init_error = code;
+}
+
+int gm_last_init_error(void)
+{
+    return s_init_error;
+}
+#endif
+
+const char *gm_init_error_str(int code)
+{
+    switch (code) {
+    case GM_INIT_OK:               return "no error";
+    case GM_INIT_ERR_NO_ADDRESS:   return "receiver address missing";
+    case GM_INIT_ERR_WINSOCK:      return "Winsock initialization failed";
+    case GM_INIT_ERR_ALLOC:        return "handle allocation failed";
+    case GM_INIT_ERR_SOCKET:       return "socket could not be opened";
+    case GM_INIT_ERR_RESOLVE:      return "receiver address failed to resolve";
+    case GM_INIT_ERR_SEND_SEGMENT: return "socket keeps a send segment shorter than the MTU";
+    default:                       return "unknown error";
+    }
+}
+
 gm_handle *gm_init(const char *receiver_ip, uint16_t port)
 {
-    if (!receiver_ip) return NULL;
-    if (gm_socket_init_winsock() != 0) return NULL;
+    if (!receiver_ip) {
+        gm_init_error_set(GM_INIT_ERR_NO_ADDRESS);
+        return NULL;
+    }
+    if (gm_socket_init_winsock() != 0) {
+        gm_init_error_set(GM_INIT_ERR_WINSOCK);
+        return NULL;
+    }
 
     gm_handle *h = (gm_handle *)calloc(1, sizeof(*h));
-    if (!h) return NULL;
+    if (!h) {
+        gm_init_error_set(GM_INIT_ERR_ALLOC);
+        return NULL;
+    }
 
-    if (gm_socket_open(receiver_ip, port, &h->sock, &h->to) != 0) {
+    /* gm_socket_open: -2 = the name did not resolve, -1 = anything else
+     * (socket creation failed). */
+    int open_rc = gm_socket_open(receiver_ip, port, &h->sock, &h->to);
+    if (open_rc != 0) {
+        if (open_rc == -2)
+            gm_init_error_set(GM_INIT_ERR_RESOLVE);
+        else
+            gm_init_error_set(GM_INIT_ERR_SOCKET);
         free(h);
         return NULL;
     }
@@ -187,6 +286,7 @@ gm_handle *gm_init(const char *receiver_ip, uint16_t port)
                     h->uso_seg, h->mtu);
             gm_socket_close(h->sock);
             free(h);
+            gm_init_error_set(GM_INIT_ERR_SEND_SEGMENT);
             return NULL;
         }
     }
@@ -204,6 +304,7 @@ gm_handle *gm_init(const char *receiver_ip, uint16_t port)
      * that a future reader, used to the neighboring mtu field which MUST be
      * set explicitly, does not assume a matching oversight here. */
 
+    gm_init_error_set(GM_INIT_OK);
     return h;
 }
 

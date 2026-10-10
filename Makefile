@@ -122,6 +122,13 @@ USO_TEST_SRC  = test/test_uso_fallback.c
 USO_TEST_BIN  = test_uso_fallback.exe
 USO_TEST_OBJS = src/gm.o src/gm_proto.o src/gm_heartbeat.o src/gm_input.o src/lz4.o
 
+# test_connreset -- a datagram sent to a closed port must not
+# leave a WSAECONNRESET queued ahead of the late peer's status or input
+# datagram. Real loopback sockets, ports 42400-42403, linked against $(LIB).
+# Windows only (Linux reports nothing on an unconnected UDP socket).
+CONNRESET_TEST_SRC = test/test_connreset.c
+CONNRESET_TEST_BIN = test_connreset.exe
+
 # test_gm_seq — clean-room rewrite: a direct unit test of
 # gm_seq_is_newer() against its documented case table. No link against
 # $(LIB): gm_seq.h is self-contained (static inline, only <stdint.h>).
@@ -145,7 +152,7 @@ endif
 ifeq ($(GM_POSIX),1)
 all: $(LIB)
 else
-all: $(LIB) $(DLL) $(SMOKE_BIN) $(INPUT_SMOKE_BIN) $(BRIDGE_DLL) $(PROBE_DLL) $(USO_TEST_BIN)
+all: $(LIB) $(DLL) $(SMOKE_BIN) $(INPUT_SMOKE_BIN) $(BRIDGE_DLL) $(PROBE_DLL) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN)
 endif
 
 $(LIB): $(LIB_OBJS)
@@ -173,6 +180,9 @@ $(SELECT_TEST_BIN): $(SELECT_TEST_SRC) src/gm_socket.c src/gm_socket.h
 
 $(USO_TEST_BIN): $(USO_TEST_SRC) src/gm_socket.c $(LIB_HDRS) $(USO_TEST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(USO_TEST_SRC) $(USO_TEST_OBJS) $(LDFLAGS)
+
+$(CONNRESET_TEST_BIN): $(CONNRESET_TEST_SRC) $(LIB_HDRS) $(LIB)
+	$(CC) $(CFLAGS) -o $@ $(CONNRESET_TEST_SRC) $(LIB) $(LDFLAGS)
 
 $(SEQ_TEST_BIN): $(SEQ_TEST_SRC) src/gm_seq.h
 	$(CC) $(CFLAGS) -o $@ $(SEQ_TEST_SRC)
@@ -209,13 +219,14 @@ ifeq ($(GM_POSIX),1)
 test: $(SELECT_TEST_BIN)
 	./$(SELECT_TEST_BIN)
 else
-test: $(SMOKE_BIN) $(SELECT_TEST_BIN) $(USO_TEST_BIN)
+test: $(SMOKE_BIN) $(SELECT_TEST_BIN) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN)
 	./$(SELECT_TEST_BIN)
 	./$(USO_TEST_BIN)
+	./$(CONNRESET_TEST_BIN)
 	@echo "libgm_smoke.exe built — run it against a live receiver"
 endif
 
 clean:
 	rm -f $(LIB) $(DLL) libgm.dll.a $(LIB_OBJS) $(SMOKE_BIN) $(INPUT_SMOKE_BIN) \
 	    $(BRIDGE_DLL) $(BRIDGE_DLL).a $(PROBE_DLL) $(PROBE_DLL).a $(SELECT_TEST_BIN) \
-	    $(SEQ_TEST_BIN) $(USO_TEST_BIN)
+	    $(SEQ_TEST_BIN) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN)

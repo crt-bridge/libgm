@@ -87,6 +87,14 @@ int gm_bind_inputs(gm_handle *h, uint16_t port)
     if (fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK) != 0) { close(s); return -1; }
 #endif
 
+    /* Same treatment as the video socket (gm_socket_open): this socket also
+     * sends to a peer that may not be listening yet -- the binding byte,
+     * resent by gm_send_input_hello to a late follower. Each one would
+     * queue a WSAECONNRESET on Windows, and gm_poll_inputs stops at the
+     * first error. Not fatal: on failure the socket stays usable, only the
+     * old behavior comes back. */
+    (void)gm_socket_ignore_port_unreachable((int)s);
+
     h->input_sock = (int)s;
 
     /* Binding takes a SINGLE byte — see this file's header. No bind() on a

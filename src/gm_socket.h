@@ -22,11 +22,23 @@ struct sockaddr_in;
 int  gm_socket_init_winsock(void);
 
 /* Create a SOCK_DGRAM socket and fill *out_to with sockaddr_in for ip:port.
- * Returns 0 on success and writes the socket fd to *out_sock. */
+ * Returns 0 on success and writes the socket fd to *out_sock. On failure,
+ * nothing stays open:
+ *   -1  invalid arguments, or the socket could not be created;
+ *   -2  ip failed to resolve (getaddrinfo refused it). */
 int  gm_socket_open(const char *ip, uint16_t port,
                     int *out_sock, struct sockaddr_in *out_to);
 
 void gm_socket_close(int sock);
+
+/* Windows: SIO_UDP_CONNRESET = FALSE, so that an ICMP "port unreachable"
+ * (a datagram sent to a closed port) no longer queues a WSAECONNRESET on
+ * the socket's receive side, ahead of real datagrams. Called by
+ * gm_socket_open and gm_bind_inputs. Returns 0, or -1 if the call fails --
+ * NEVER fatal to the caller: the socket stays usable, only the old
+ * behavior (queued errors) comes back. POSIX: does nothing, returns 0
+ * (no ICMP error on an unconnected UDP socket; libgm never connect()s). */
+int  gm_socket_ignore_port_unreachable(int sock);
 
 /* sendto wrapper. Returns bytes sent (>=0) or -1 on error. */
 int  gm_socket_sendto(int sock, const void *buf, size_t len,

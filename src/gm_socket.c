@@ -3,7 +3,9 @@
  *
  * Tiny POSIX-style wrappers over Winsock so the rest of
  * libgm doesn't have to drag <winsock2.h> into every translation unit. All
- * functions return 0 on success, -1 on error (or bytes for sendto/recvfrom).
+ * functions return 0 on success, -1 on error (or bytes for sendto/recvfrom),
+ * except gm_socket_open, which also returns -2 for a name that does not
+ * resolve (see gm_socket.h).
  *
  * Threading model: WSAStartup is called once per process via a static guard.
  * Sockets themselves are per-handle (owned by gm_handle in gm.c); no shared
@@ -19,6 +21,11 @@
  * use on this machine (checked 2026-09-25). */
 #  ifndef UDP_SEND_MSG_SIZE
 #  define UDP_SEND_MSG_SIZE 2
+#  endif
+/* mswsock.h / mstcpip.h -- not included here, and missing from some MinGW
+ * header sets. Value documented by Microsoft (Winsock IOCTLs). */
+#  ifndef SIO_UDP_CONNRESET
+#  define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #  endif
 typedef SOCKET  gm_sock_t;
 #  define GM_BAD_SOCK  INVALID_SOCKET
@@ -100,7 +107,7 @@ int gm_socket_open(const char *ip, uint16_t port,
 #else
         close(s);
 #endif
-        return -1;               /* unknown name: clean refusal, nothing sent */
+        return -2;               /* unknown name: clean refusal, nothing sent */
     }
 
     memset(out_to, 0, sizeof(*out_to));
@@ -110,7 +117,41 @@ int gm_socket_open(const char *ip, uint16_t port,
     out_to->sin_family = AF_INET;
     out_to->sin_port   = htons(port);
 
+    /* Port-unreachable reports off (Windows) -- see
+     * gm_socket_ignore_port_unreachable. A failure does NOT fail the open:
+     * the socket stays fully usable, only the old behavior comes back (one
+     * queued error per datagram sent to a closed port, read before the
+     * statuses that arrive behind it). */
+    (void)gm_socket_ignore_port_unreachable((int)s);
+
     *out_sock = (int)s;
+    return 0;
+}
+
+/* See the contract in gm_socket.h.
+ *
+ * WHY: on Windows, every datagram sent to a closed UDP port earns an ICMP
+ * "port unreachable", and Winsock queues ONE WSAECONNRESET per ICMP on the
+ * socket's receive side, AHEAD of the datagrams that arrive after it. A
+ * caller that stops reading at the first error (gm_recv_status returns -1,
+ * the driver's status drain stops) then reads the late peer's statuses
+ * seconds late -- 1.1 to 2.4 s measured on a follower that opens after the
+ * emitter. With SIO_UDP_CONNRESET set to FALSE, Winsock
+ * no longer queues these errors; nothing else about the socket changes.
+ *
+ * Off Windows: nothing to do. Linux reports ICMP errors only on a CONNECTED
+ * UDP socket (or with IP_RECVERR), and libgm never calls connect() on its
+ * sockets -- every send goes through sendto with an explicit address. */
+int gm_socket_ignore_port_unreachable(int sock)
+{
+    if (sock < 0) return -1;
+#ifdef _WIN32
+    BOOL  report = FALSE;
+    DWORD ret    = 0;
+    if (WSAIoctl((SOCKET)sock, (DWORD)SIO_UDP_CONNRESET, &report, (DWORD)sizeof(report),
+                 NULL, 0, &ret, NULL, NULL) == SOCKET_ERROR)
+        return -1;
+#endif
     return 0;
 }
 

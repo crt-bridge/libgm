@@ -262,6 +262,9 @@ static void case_open_short_readback_reset_refused(void)
     reset_fakes(); f_get_forced = 1400; f_reset_fail = 1;
     gm_handle *h = open_handle();
     check(c, "gm_init refuses (segment stays at 1400, shorter than the 1472 MTU)", h == NULL);
+    /* Same case, second check: the refusal reports its own cause. */
+    check(c, "gm_last_init_error() reports GM_INIT_ERR_SEND_SEGMENT",
+          gm_last_init_error() == GM_INIT_ERR_SEND_SEGMENT);
     if (h) gm_close(h);
 }
 
