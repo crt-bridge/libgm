@@ -21,10 +21,10 @@
  *
  * Include path requirements:
  *   - gm.h: from include/ (CFLAGS -Iinclude already set in the Makefile)
- *   - groovy_modeline.h, groovy_pacing.h and the other groovy_*.h: the
+ *   - groovy_announce.h, groovy_pacing.h and the other groovy_*.h: the
  *     RetroArch driver's headers, outside this repository (BRIDGE_CFLAGS)
  *
- * NOTE: groovy_modeline.h guards against inclusion before gm.h with
+ * NOTE: groovy_announce.h guards against inclusion before gm.h with
  *   #error if GM_H is not defined. This TU includes gm.h first.
  *   groovy_pacing.h has the same guard.
  */
@@ -69,14 +69,16 @@ static void groovy_servo_log_test(const char *evt) {
 
 /* ── Include shared headers (after overrides) ─────────────────────────────── */
 
-/* Single 240p/480i regime decision, shared with the driver. Must precede
- * groovy_modeline.h: compute_modeline_from_dims now calls
- * groovy_mode_classify to derive v_total and interlace from the same rule
- * as the regime decision. */
+/* Single 240p/480i/480p/session regime decision, shared with the driver. */
 #include "groovy_mode.h"
 
-/* Shared modeline computation (must follow gm.h per header guard). */
+/* Fall-back libretro geometry structures (no modeline is computed there any
+ * more). */
 #include "groovy_modeline.h"
+
+/* The pinned modelines and groovy_announce_pinned(): the one function every
+ * announcement goes through, here as in the driver. */
+#include "groovy_announce.h"
 
 /* ACK-pacing state machine (must follow gm.h per header guard and AFTER the
  * GROOVY_PACING_MONO_NS_OVERRIDE define above). */
@@ -121,6 +123,10 @@ static void groovy_servo_log_test(const char *evt) {
  * decision. Same pattern as groovy_dump.h above (no dependency on
  * gm.h). */
 #include "groovy_skip.h"
+
+/* Fault-injection grammar and pure decisions: reads GROOVY_INJECT. Same
+ * pattern as groovy_skip.h above (no dependency on gm.h, no clock). */
+#include "groovy_inject.h"
 
 /* Lever 1 switch: reads GROOVY_FRAME_DUP. Same pattern as
  * groovy_compression.h above -- no dependency on gm.h, the boolean
@@ -187,13 +193,26 @@ static void groovy_servo_log_test(const char *evt) {
  * (w, h, fps) tuple but different ports collided — test #1 populated the
  * cache, test #2 hit dedupe and emitted 0 packets. The reset entry point
  * (added below) resolves this by clearing state between tests. */
-static groovy_av_cache_t        g_av_cache        = { 0, 0, 0.0, false };
+static groovy_av_cache_t        g_av_cache        = { 0, 0, 0.0, false, GROOVY_MODE_240P_SUPER_RES };
 static double                   g_last_valid_fps  = 0.0;
 static struct groovy_mode_state g_mode_state;
+/* The modeline last sent by test_groovy_push_frame (mirrors
+ * groovy_state_t::announced_mode / announced_valid): a size change inside the
+ * same regime announces the same modeline and sends nothing. */
+static gm_modeline              g_announced_mode;
+static bool                     g_announced_valid = false;
+/* The mode of the session (mirrors groovy_state_t::session): read by
+ * test_session_set, seen by the regime rule through g_mode_state.session
+ * only when it was read in full, as in groovy_new. */
+static struct groovy_session_mode g_session;
+/* What the status line of the mode last said (mirrors
+ * groovy_state_t::mode_said). */
+static struct groovy_announce_said g_status_said;
 
 /* test_groovy_reset_av_cache — exported reset entry point for Python ctypes.
  *
- * Zeroes g_av_cache, g_last_valid_fps, g_mode_state, AND the mock monotonic
+ * Zeroes g_av_cache, g_last_valid_fps, g_mode_state (the session policy
+ * khz31 goes back to off with it), AND the mock monotonic
  * clock (the guard's switch_ns[]/last_request_ns entries would otherwise
  * leak a stale "now" across scenarios that don't call
  * test_pacing_set_mock_time_ns themselves). Must be called (or invoked via
@@ -202,7 +221,11 @@ DLLEXPORT void test_groovy_reset_av_cache(void)
 {
     memset(&g_av_cache, 0, sizeof(g_av_cache));
     g_last_valid_fps = 0.0;
-    memset(&g_mode_state, 0, sizeof(g_mode_state));
+    memset(&g_session, 0, sizeof(g_session));
+    memset(&g_mode_state, 0, sizeof(g_mode_state));   /* the session pointer goes with it */
+    memset(&g_announced_mode, 0, sizeof(g_announced_mode));
+    g_announced_valid = false;
+    memset(&g_status_said, 0, sizeof(g_status_said));
     mock_mono_ns_g = 0u;
 }
 
@@ -248,6 +271,8 @@ DLLEXPORT int test_groovy_push_av_info(
  *   - Returns 1 (KEEP): nothing changed, nothing sent.
  *   - Returns 2 (DROP_FROZEN): the guard refused this regime switch.
  *   - Returns 0: cache updated and CMD_SWITCHRES sent successfully.
+ *   - Returns 3: cache updated, but the modeline is the one already
+ *     announced (a size change inside the same regime): no CMD_SWITCHRES.
  *   - Returns -2: libgm error (gm_init or gm_send_switchres failed).
  * ------------------------------------------------------------------------- */
 DLLEXPORT int test_groovy_push_frame(
@@ -279,10 +304,14 @@ DLLEXPORT int test_groovy_push_frame(
         return 2;
 
     /* a == GROOVY_MODE_ANNOUNCE: same pipeline as push_video —
-     * modeline computed on the cache groovy_mode_on_frame just wrote, then
-     * sent. */
+     * the pinned modeline of the regime groovy_mode_on_frame just wrote in
+     * the cache, then sent. */
     gm_modeline mode;
-    compute_modeline_from_dims(g_av_cache.width, g_av_cache.height, g_av_cache.fps, &mode);
+    groovy_announce_modeline(groovy_mode_of(&g_av_cache), &g_session, &mode);
+
+    if (groovy_announce_is_repeat(g_announced_valid, &g_announced_mode, &mode,
+                                  g_mode_state.last_reason))
+        return 3;
 
     gm_handle *gm = gm_init(ip, port);
     if (!gm)
@@ -291,7 +320,90 @@ DLLEXPORT int test_groovy_push_frame(
     int rc = gm_send_switchres(gm, &mode);
     gm_close(gm);
 
+    g_announced_mode  = mode;
+    g_announced_valid = true;
+
     return (rc == 0) ? 0 : -2;
+}
+
+/* ---------------------------------------------------------------------------
+ * The mode of the session (groovy_session.h). test_session_set reads a
+ * GROOVY_MODE value the way groovy_new reads the variable and keeps it in
+ * the bridge state: 0 = read in full, or absent/empty (no session); -1 =
+ * refused as a whole, the reason in `why`. NULL clears. The regime rule sees
+ * the session only when it was read in full.
+ * ------------------------------------------------------------------------- */
+DLLEXPORT int test_session_set(const char *value, char *why, size_t cap)
+{
+    int rc;
+
+    if (why && cap > 0u)
+        why[0] = '\0';
+    if (!value) {
+        memset(&g_session, 0, sizeof(g_session));
+        g_mode_state.session = NULL;
+        return 0;
+    }
+    rc = groovy_session_parse(value, &g_session, why, cap);
+    g_mode_state.session = (rc == 0 && g_session.valid) ? &g_session : NULL;
+    return rc;
+}
+
+/* which: 0 valid, 1 khz, 2..5 h_active h_begin h_end h_total, 6..9 v_active
+ * v_begin v_end v_total, 10 interlace, 11 kx, 12 ky, 13 crop_lines,
+ * 14 crop_cols. */
+DLLEXPORT unsigned test_session_value(int which)
+{
+    switch (which) {
+    case 0:  return g_session.valid ? 1u : 0u;
+    case 1:  return (unsigned)g_session.khz;
+    case 2:  return (unsigned)g_session.h_active;
+    case 3:  return (unsigned)g_session.h_begin;
+    case 4:  return (unsigned)g_session.h_end;
+    case 5:  return (unsigned)g_session.h_total;
+    case 6:  return (unsigned)g_session.v_active;
+    case 7:  return (unsigned)g_session.v_begin;
+    case 8:  return (unsigned)g_session.v_end;
+    case 9:  return (unsigned)g_session.v_total;
+    case 10: return (unsigned)g_session.interlace;
+    case 11: return (unsigned)g_session.kx;
+    case 12: return (unsigned)g_session.ky;
+    case 13: return (unsigned)g_session.crop_lines;
+    case 14: return (unsigned)g_session.crop_cols;
+    default: return 0u;
+    }
+}
+
+/* 1 when the regime rule can see a session (the pointer set by test_session_set). */
+DLLEXPORT int test_session_seen_by_mode(void)
+{
+    return g_mode_state.session ? 1 : 0;
+}
+
+DLLEXPORT int test_session_fits(unsigned w, unsigned h)
+{
+    return groovy_session_fits(&g_session, w, h) ? 1 : 0;
+}
+
+/* The picture is its own reference: the rule of the engine's factors brought
+ * back to what fits (a picture that keeps its size). */
+DLLEXPORT void test_session_factors(unsigned w, unsigned h, unsigned *kx, unsigned *ky)
+{
+    groovy_session_factors(&g_session, w, h, w, h, kx, ky);
+}
+
+/* The same rule with the size of the first picture composed under the
+ * session (0 x 0 = none yet): a picture of another size takes the largest
+ * whole factor that fits the mode. */
+DLLEXPORT void test_session_factors_ref(unsigned w, unsigned h, unsigned ref_w, unsigned ref_h,
+                                        unsigned *kx, unsigned *ky)
+{
+    groovy_session_factors(&g_session, w, h, ref_w, ref_h, kx, ky);
+}
+
+DLLEXPORT unsigned test_session_max_frame_bytes(void)
+{
+    return (unsigned)GROOVY_SESSION_MAX_FRAME_BYTES;
 }
 
 /* ---------------------------------------------------------------------------
@@ -302,6 +414,17 @@ DLLEXPORT int test_groovy_push_frame(
 DLLEXPORT int test_mode_classify(unsigned h)
 {
     return (int)groovy_mode_classify(h);
+}
+
+/* The session policy: the receiver takes 31 kHz. Off after every reset. */
+DLLEXPORT void test_mode_set_khz31(int on)
+{
+    g_mode_state.khz31 = on ? true : false;
+}
+
+DLLEXPORT int test_mode_classify_policy(unsigned h, int khz31)
+{
+    return (int)groovy_mode_classify_policy(h, khz31 ? true : false);
 }
 
 DLLEXPORT void test_mode_on_declare(unsigned w, unsigned h)
@@ -357,14 +480,86 @@ DLLEXPORT uint64_t test_mode_counter(int which)
     }
 }
 
-DLLEXPORT void test_modeline_from_dims(unsigned w, unsigned h, double fps,
-        unsigned *v_total, unsigned *h_total, unsigned *interlace)
+/* The modeline that goes on the wire for `regime` (0 = 240p, 1 = 480i, 2 = 480p, 3 = the
+ * session read by test_session_set), built by the one function every
+ * announcement goes through. out[0..9]: clock in whole kHz, h_active, h_begin,
+ * h_end, h_total, v_active, v_begin, v_end, v_total, interlace. Nothing is
+ * derived from the size of a picture. */
+DLLEXPORT void test_announce_modeline(int regime, unsigned *out)
 {
     gm_modeline mode;
-    compute_modeline_from_dims(w, h, fps, &mode);
-    if (v_total)   *v_total   = mode.v_total;
-    if (h_total)   *h_total   = mode.h_total;
-    if (interlace) *interlace = mode.interlace;
+
+    groovy_announce_modeline((enum groovy_mode)regime, &g_session, &mode);
+    out[0] = (unsigned)(mode.pclock_mhz * 1000.0 + 0.5);
+    out[1] = mode.h_active;  out[2] = mode.h_begin;
+    out[3] = mode.h_end;     out[4] = mode.h_total;
+    out[5] = mode.v_active;  out[6] = mode.v_begin;
+    out[7] = mode.v_end;     out[8] = mode.v_total;
+    out[9] = mode.interlace;
+}
+
+/* The status line of the mode (groovy_announce.h) for `regime` and the scale
+ * kx x ky, built on the modeline the one announcement function gives for
+ * that regime (the session read by test_session_set in the regime of the
+ * session). `by_env` is what the driver passes: non-zero when GROOVY_MODE
+ * imposes the mode. Returns the length written, or -1. */
+DLLEXPORT int test_announce_status(int regime, unsigned kx, unsigned ky, int by_env,
+                                   const char *reason, char *dst, size_t cap)
+{
+    gm_modeline mode;
+
+    groovy_announce_modeline((enum groovy_mode)regime, &g_session, &mode);
+    return groovy_announce_status_format(dst, cap, &mode, kx, ky, by_env, reason);
+}
+
+/* 1 when the status line is due for `regime` at the scale kx x ky (the state
+ * is kept between calls and reset with the cache), 0 when it would repeat. */
+DLLEXPORT int test_announce_status_due(int regime, unsigned kx, unsigned ky)
+{
+    gm_modeline mode;
+
+    groovy_announce_modeline((enum groovy_mode)regime, &g_session, &mode);
+    return groovy_announce_status_due(&g_status_said, &mode, kx, ky,
+                                      regime == (int)GROOVY_MODE_SESSION);
+}
+
+/* GROOVY_MODE_REASON read: 0 = read (copied to dst), -1 = absent, empty or
+ * refused (dst empty). */
+DLLEXPORT int test_announce_reason_parse(const char *s, char *dst, size_t cap)
+{
+    return groovy_announce_reason_parse(s, dst, cap);
+}
+
+/* The reason the driver gives the line for a case (groovy_announce_status_reason):
+ * copied to dst, its length returned; -1 when the case gives none (the line
+ * then reads the default of its case). */
+DLLEXPORT int test_announce_status_reason(int by_env, int session_valid, int session_refused,
+                                          int reason_set, const char *reason,
+                                          char *dst, size_t cap)
+{
+    const char *why = groovy_announce_status_reason(by_env, session_valid, session_refused,
+                                                    reason_set, reason);
+    if (!dst || cap == 0u)
+        return -1;
+    dst[0] = '\0';
+    if (!why)
+        return -1;
+    snprintf(dst, cap, "%s", why);
+    return (int)strlen(dst);
+}
+
+DLLEXPORT unsigned test_announce_reason_max(void)
+{
+    return (unsigned)GROOVY_MODE_REASON_MAX;
+}
+
+/* The cadence (fields per second when interlaced) of the pinned modeline of
+ * `regime`, on the clock brought back to a whole number of kHz. */
+DLLEXPORT double test_announce_cadence_hz(int regime)
+{
+    gm_modeline mode;
+    groovy_announce_pinned((enum groovy_mode)regime, &mode);
+    return groovy_announce_cadence_hz(&mode);
 }
 
 /* ---------------------------------------------------------------------------
@@ -485,6 +680,14 @@ DLLEXPORT void test_downsample_box_generic(uint8_t *dst, const uint8_t *src,
                                            unsigned src_w, unsigned src_h, unsigned n)
 {
     groovy_downsample_box_rgb888_generic(dst, src, src_w, src_h, n);
+}
+
+/* The per-frame decision of the factor the CPU box still applies (0 = frame
+ * refused) -- same code as record_groovy.c. */
+DLLEXPORT unsigned test_downsample_cpu_factor(unsigned factor,
+                                              unsigned prereduced)
+{
+    return groovy_downsample_cpu_factor(factor, prereduced);
 }
 
 /* The input converters from groovy_convert.h. fmt: 0 BGR24, 1 XRGB8888,
@@ -675,6 +878,12 @@ DLLEXPORT int test_dump_name(char *dst, size_t cap, const char *path,
     return groovy_dump_name(dst, cap, path, seq, counter);
 }
 
+/* One witness row: the wire row (B, G, R) put back in PPM order (R, G, B). */
+DLLEXPORT void test_dump_row_ppm(uint8_t *dst, const uint8_t *src, size_t width)
+{
+    groovy_dump_row_ppm(dst, src, width);
+}
+
 /* ---------------------------------------------------------------------------
  * Diagnostic hook. Same code as record_groovy.c -- the header is
  * included, not copied. What is green here is true in the driver.
@@ -687,6 +896,68 @@ DLLEXPORT unsigned test_skip_every_parse(const char *s)
 DLLEXPORT int test_skip_should_skip(unsigned every, uint32_t frame_id)
 {
     return groovy_skip_should_skip(every, frame_id);
+}
+
+/* ---------------------------------------------------------------------------
+ * Fault injection (GROOVY_INJECT). Same code as record_groovy.c -- the
+ * header is included, not copied. One thin export per header function.
+ * ------------------------------------------------------------------------- */
+DLLEXPORT unsigned test_inject_parse(const char *s,
+                                     struct groovy_inject_item *out,
+                                     unsigned cap)
+{
+    return groovy_inject_parse(s, out, cap);
+}
+
+DLLEXPORT size_t test_inject_item_size(void)
+{
+    return sizeof(struct groovy_inject_item);
+}
+
+DLLEXPORT int test_inject_pending(const struct groovy_inject_item *items,
+                                  unsigned n, uint32_t kind,
+                                  uint64_t elapsed_ns)
+{
+    return groovy_inject_pending(items, n, kind, elapsed_ns);
+}
+
+DLLEXPORT void test_inject_fire(struct groovy_inject_item *it,
+                                uint32_t frame_id, uint64_t now_ns)
+{
+    groovy_inject_fire(it, frame_id, now_ns);
+}
+
+DLLEXPORT void test_inject_parity_observe(struct groovy_inject_parity *p,
+                                          int is_480i_fpf, uint32_t frame_id)
+{
+    groovy_inject_parity_observe(p, is_480i_fpf, frame_id);
+}
+
+DLLEXPORT int test_inject_parity_eligible(const struct groovy_inject_parity *p,
+                                          int is_480i_fpf, uint32_t frame_id)
+{
+    return groovy_inject_parity_eligible(p, is_480i_fpf, frame_id);
+}
+
+DLLEXPORT void test_inject_parity_fired(struct groovy_inject_parity *p)
+{
+    groovy_inject_parity_fired(p);
+}
+
+DLLEXPORT size_t test_inject_parity_size(void)
+{
+    return sizeof(struct groovy_inject_parity);
+}
+
+DLLEXPORT int test_inject_window_active(uint64_t start_ns, uint64_t dur_ns,
+                                        uint64_t now_ns)
+{
+    return groovy_inject_window_active(start_ns, dur_ns, now_ns);
+}
+
+DLLEXPORT const char *test_inject_kind_name(uint32_t kind)
+{
+    return groovy_inject_kind_name(kind);
 }
 
 /* ---------------------------------------------------------------------------
@@ -995,6 +1266,13 @@ DLLEXPORT double test_servo_cadence_hz(double pclock_hz, unsigned h_total, unsig
 DLLEXPORT double test_servo_ff_ppm(double cadence_hz, double video_refresh_rate_hz)
 {
     return groovy_servo_ff_ppm(cadence_hz, video_refresh_rate_hz);
+}
+
+/* The reference cadence of a regime (enum groovy_mode: 0 = 240p, 1 = 480i,
+ * 2 = 480p), the same function the driver's feed-forward calls. */
+DLLEXPORT double test_servo_regime_cadence_hz(int regime)
+{
+    return groovy_servo_regime_cadence_hz((enum groovy_mode)regime);
 }
 
 DLLEXPORT double test_servo_term(const groovy_servo_state_t *st)

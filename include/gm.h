@@ -351,7 +351,8 @@ uint32_t gm_frame_dup_count(gm_handle *h);
  * chunks -- but tells libgm WHICH field parity is travelling, information
  * the 0x06 header does not carry and that the receiver infers from
  * frame_id & 1. `field` does NOT go on the wire: it is only used for
- * frame-skip bookkeeping (previous buffer per parity, pairing rule). */
+ * frame-skip bookkeeping (previous buffer per parity, pairing rule).
+ * Pixel bytes: see gm_send_blit (three bytes per pixel, B, G, R). */
 int      gm_send_blit_half(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                            uint8_t field, const uint8_t *rgb888, size_t bytes);
 
@@ -429,6 +430,16 @@ const char *gm_init_error_str(int code);
 int        gm_set_mtu(gm_handle *h, unsigned mtu);
 int        gm_send_init(gm_handle *h, const gm_init_params *p);
 int        gm_send_switchres(gm_handle *h, const gm_modeline *m);
+
+/* Emit one progressive frame via CMD_BLIT_VSYNC (0x06).
+ *
+ * `rgb888` points at `bytes` of pixel data, THREE BYTES PER PIXEL IN THE
+ * ORDER B, G, R -- the order of the upstream Groovy core and of GroovyMAME.
+ * "RGB888" is only the name of the wire format. A yellow pixel (R 255,
+ * G 255, B 0) is 00 FF FF; a red one 00 00 FF; a blue one FF 00 00. libgm
+ * never looks inside the pixels (it compresses, chunks and compares them as
+ * opaque bytes), so the caller owns the order. The same holds for
+ * gm_send_blit_field and gm_send_blit_half. */
 int        gm_send_blit(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                         const uint8_t *rgb888, size_t bytes);
 
@@ -439,6 +450,7 @@ int        gm_send_blit(gm_handle *h, uint32_t frame_id, uint16_t vsync,
  * compression=1 — the receiver refuses the 8-byte form outright once
  * compressed (PARSE_BAD_COMPRESSION), it will not guess.
  * Each field is compressed and sent as its own independent LZ4 block.
+ * Pixel bytes: three per pixel, B, G, R (see gm_send_blit).
  * Returns 0 on success, -1 on error. */
 int        gm_send_blit_field(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                               uint8_t field, const uint8_t *rgb888, size_t bytes);
