@@ -46,6 +46,7 @@
 #define FLAG_VGA_VBLANK      0x10
 #define FLAG_VGA_F1          0x20
 #define FLAG_AUDIO           0x40
+#define FLAG_NATIVE_OK       0x80   /* padded session only: peer understands CMD_NATIVE_SCALE / _PLACE */
 #define FLAG_VRAM_QUEUE      0x80
 
 /* ---------------------------------------------------------------------------
@@ -195,6 +196,14 @@ _Static_assert(sizeof(gm_ps2_inputs) == 41, "keyboard + mouse = 41 bytes");
  * sharing the same gm_handle. If a caller needs concurrent send + recv, the
  * caller must own the synchronization.
  *
+ * Exception, a CODEC session (a CMD_INIT with compression 0x10 or 0x11): the
+ * codec thread sends its frames on the same handle as the caller, so such a
+ * handle carries a recursive lock. It serialises the gm_send_* family, the
+ * gm_set_* settings and the status cache of gm_recv_status; waiting on the
+ * socket never holds it. The lock is taken only in a codec session: any other
+ * handle is unchanged (single thread, no lock, same bytes on the wire). A caller
+ * that reads last_status from another thread is still on its own.
+ *
  * gm_heartbeat_start/stop is OPT-IN. The heartbeat thread internally calls
  * gm_send_get_status_internal which performs sendto on h->sock. If the caller
  * also calls gm_send_blit on the SAME handle from another thread, the caller
@@ -310,7 +319,7 @@ int      gm_set_frame_dup(gm_handle *h, int on);
  * | CMD_GET_STATUS 0x05            | 1: `05`                  | 8: `05 00 00 00 00 00 00 00`            | 7 zeros |
  * | CMD_BLIT_VSYNC 0x06            | 11                       | 11, UNCHANGED                           | --      |
  * | CMD_BLIT_FIELD_VSYNC 0x07      | 8 / 9 / 12               | UNCHANGED                               | --      |
- * | CMD_GET_VERSION 0x08           | 1                        | libgm NEVER EMITS IT                    | --      |
+ * | CMD_GET_VERSION 0x08           | 1                        | 1, UNCHANGED (gm_probe_peer only)       | --      |
  *
  * PAYLOADS (PCM chunks, image chunks) are NEVER padded -- only the small
  * command header is; padding a payload would throw off the receiver's
@@ -320,9 +329,9 @@ int      gm_set_frame_dup(gm_handle *h, int on);
  * audio), and a WHOLE audio block under 256 bytes is held back and glued
  * to the front of the next one. The one accepted exception: a WHOLE image
  * under 256 bytes goes out as-is. See gm_next_chunk.
- * No crt-bridge emitter sends `CMD_GET_VERSION`: nothing to
- * code here, its padding will only ever live in later recognition tables,
- * not in this header.
+ * CMD_GET_VERSION is sent only by gm_probe_peer, always as the
+ * original single byte: a 1-byte datagram sent alone passes on the measured
+ * Wi-Fi, and the probe repeats it.
  *
  * ABSENT setting = BIT-IDENTICAL wire: without this call, gm_send_init and
  * the three other short emitters (gm_send_audio, gm_send_close,
@@ -339,6 +348,56 @@ int      gm_set_frame_dup(gm_handle *h, int on);
  * promise one works: a CMD_INIT already sent in one mode does not
  * retroactively change shape. */
 int      gm_set_padding(gm_handle *h, int on);
+
+/* ---------------------------------------------------------------------------
+ * Padded HEADERS only -- a stock MiSTer core.
+ *
+ * The Groovy core on a MiSTer, forked to accept CMD_INIT, CMD_AUDIO,
+ * CMD_CLOSE and CMD_GET_STATUS of 8 bytes (up to 26), keeps the wire form of
+ * everything else: its receive path does NOT accept the full padded session's
+ * rebalanced tails (1472 + 738 + 738 is thrown away as losses). So the mode
+ * is a third value of the same session mode:
+ *
+ *   GM_PAD_OFF      0  classic: the original forms, byte for byte (DEFAULT)
+ *   GM_PAD_FULL     1  the padded session of gm_set_padding(h, 1), unchanged
+ *   GM_PAD_HEADERS  2  the four short headers padded to GM_PAD_LEN, the
+ *                      payload chunked EXACTLY as in classic mode (mtu, then
+ *                      the remainder) -- with one difference for AUDIO: a
+ *                      block never ends in a tail of 1..GM_HDR_TAIL_MIN-1
+ *                      bytes (it would pass for a command on the receiver,
+ *                      which now accepts forms up to 26 bytes); those last
+ *                      bytes are held back and glued to the next block, the
+ *                      sample order preserved.
+ *
+ * KNOWN LIMIT: the tail of a VIDEO block (an LZ4 frame) cannot be moved the
+ * same way -- rebalancing it is the very split the forked core throws away.
+ * A frame ending in 1..26 bytes, whose header was lost, can still be read
+ * as a command by that core; the cure is on the core's side.
+ *
+ * Same discipline as gm_set_padding: call after gm_init, BEFORE gm_send_init.
+ * Returns 0, -1 if h is NULL or mode is not one of the three values. */
+#define GM_PAD_OFF         0
+#define GM_PAD_FULL        1
+#define GM_PAD_HEADERS     2
+#define GM_HDR_TAIL_MIN    32u   /* above the 26 bytes the forked core takes as a command */
+int      gm_set_padding_mode(gm_handle *h, int mode);
+
+/* What a peer answers to CMD_GET_VERSION (0x08), sent alone, 1 byte:
+ *   GM_PEER_UNKNOWN  no answer, or an answer of another shape (the crt-bridge
+ *                    receiver answers with its 13-byte status) -- change nothing
+ *   GM_PEER_STOCK    exactly 1 byte: the original Groovy core. Its AUDIO
+ *                    header is 3 bytes and dies on a Wi-Fi link
+ *   GM_PEER_PADDED   `01 43 42 <revision> ...`: the core forked for padded
+ *                    headers. *rev gets the revision byte; never compare it
+ *                    for equality, a later revision is still capable.
+ * Sends up to `tries` requests, waiting `timeout_ms` after each; a request
+ * that dies on the way is simply repeated. Consumes the datagrams it reads
+ * (a status ack read here is not replayed). Returns one of the three values,
+ * or -1 if h is NULL. */
+#define GM_PEER_UNKNOWN    0
+#define GM_PEER_STOCK      1
+#define GM_PEER_PADDED     2
+int      gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev);
 
 /* Number of frame_dup packets emitted since the session opened. A
  * monotonic counter, reset by no function: the caller takes the difference
@@ -430,6 +489,81 @@ const char *gm_init_error_str(int code);
 int        gm_set_mtu(gm_handle *h, unsigned mtu);
 int        gm_send_init(gm_handle *h, const gm_init_params *p);
 int        gm_send_switchres(gm_handle *h, const gm_modeline *m);
+
+/* Native-width contract (CMD_NATIVE_SCALE, 0x09). PADDED SESSION ONLY: in a
+ * classic session this returns -1 and sends nothing (the peer would not
+ * recognise the command).
+ *
+ * Announces that the frames that follow hold (h_active / kx) x (v_active / ky)
+ * pixels, the receiver enlarging them back. kx and ky are 1..8; the caller is
+ * responsible for the frame size it then passes to gm_send_blit*.
+ *
+ * The factors are remembered: every later gm_send_switchres repeats the 0x09
+ * right after its own datagram, because the receiver starts again at full
+ * width on each CMD_SWITCHRES. Calling it again with other factors sends the
+ * new 0x09 at once and invalidates the frame-dup memory. (1, 1) withdraws the
+ * announcement and tells the peer so.
+ * Returns 0 on success, -1 on a bad argument, a classic session or a failed
+ * send. */
+int        gm_set_native_scale(gm_handle *h, unsigned kx, unsigned ky);
+
+/* Repeats the announced factors (UDP loses datagrams; a receiver that missed
+ * the 0x09 would drop every native frame until the next CMD_SWITCHRES). Sends
+ * nothing, and returns 0, when no factor above 1 is in force or the session is
+ * classic. The caller picks the rhythm (a few times a second is plenty). */
+int        gm_resend_native_scale(gm_handle *h);
+
+/* CMD_NATIVE_PLACE (0x0A), padded session only, 8 bytes, the superset of
+ * gm_set_native_scale: the frames that follow hold w x hh pixels (the whole
+ * frame, also in 480i), the receiver enlarges them by kx, ky and CENTRES the
+ * result in the mode, black around it. kx, ky are 1..8 (1, 1 is allowed: a
+ * picture smaller than the mode, just placed), w and hh 1..65535. The caller
+ * guarantees that w * kx and hh * ky fit the announced mode, and in 480i that
+ * ky is 1 and hh is even; the receiver refuses what does not. Same memory,
+ * same repetition behind each CMD_SWITCHRES and by gm_resend_native_scale as
+ * the 0x09; calling gm_set_native_scale afterwards withdraws it. Returns 0,
+ * or -1 (bad argument, classic session, failed send). */
+int        gm_set_native_place(gm_handle *h, unsigned kx, unsigned ky, unsigned w, unsigned hh);
+
+/* 1 when the last status received from the peer carried FLAG_NATIVE_OK (0x80):
+ * the peer understands the native contract (it is raised in a padded session
+ * only, and only by a receiver or client that knows 0x09 / 0x0A). 0 for a
+ * classic session, no status yet, or an older receiver. */
+int        gm_peer_native_ok(const gm_handle *h);
+
+/* --- Codec session (H.264 / HEVC), padded session only ------------------------
+ * The image payload of a codec session is not the Groovy arrival-order wire: a
+ * codec frame depends on the previous one, so a lost datagram must be rebuilt, not
+ * waited out. gm_send_init with params.compression = GM_CODEC_H264 / GM_CODEC_HEVC
+ * opens it (refused, -1, in a classic session); the commands stay Groovy
+ * (CMD_SWITCHRES, CMD_AUDIO, statuses). gm_send_blit* are refused in such a session:
+ * the frame goes by gm_send_codec_frame.
+ *
+ * The caller encodes (a keyframe at the start and after every CMD_SWITCHRES) and
+ * hands the bitstream of ONE frame. libgm cuts it into shards of at most the session
+ * MTU with a 6-byte header, adds Reed-Solomon parity (default 10 %, gm_set_codec_parity
+ * 0..100), and sends them after a CMD_BLIT_VSYNC header that carries the frame_id and the vsync. The
+ * shards are numbered by their own consecutive counter (a hole there is a frame lost in transit). See
+ * libgm/src/gm_shard.h for the datagram. Returns 0, or -1. */
+#define GM_CODEC_H264 0x10
+#define GM_CODEC_HEVC 0x11
+int        gm_set_codec_parity(gm_handle *h, unsigned pct);
+int        gm_send_codec_frame(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                               const uint8_t *bitstream, size_t len, int keyframe);
+
+/* Which codecs the last status of the peer says it can decode (padded session only):
+ * bit 0 = H.264, bit 1 = HEVC. 0 for a classic session, no status yet, or a peer that
+ * knows no codec. The bits are FLAG_CODEC_H264 (0x08) and FLAG_CODEC_HEVC (0x10). */
+#define FLAG_CODEC_H264 0x08
+#define FLAG_CODEC_HEVC 0x10
+unsigned   gm_peer_codecs(const gm_handle *h);
+
+/* Codec session: 1 (once) when the client has asked for a keyframe since the last call: it lost its reference
+ * (a frame it could not put back together, a decoder error). The request travels in the 13-byte status the client
+ * already sends after every picture and every poll: bytes 10-11 are a counter that moves per request, so a lost
+ * status loses nothing. The caller encodes the next picture as a keyframe. Call it on the thread that calls
+ * gm_recv_status. Always 0 outside a codec session. */
+int        gm_codec_idr_requested(gm_handle *h);
 
 /* Emit one progressive frame via CMD_BLIT_VSYNC (0x06).
  *

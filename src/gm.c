@@ -304,11 +304,21 @@ gm_handle *gm_init(const char *receiver_ip, uint16_t port)
      * that a future reader, used to the neighboring mtu field which MUST be
      * set explicitly, does not assume a matching oversight here. */
 
+    GM_LOCK_INIT(&h->send_lock);   /* taken only once a codec session starts (send_lock_on), see gm_internal.h */
     gm_init_error_set(GM_INIT_OK);
     return h;
 }
 
+static int gm_set_mtu_nolock(gm_handle *h, unsigned mtu);
 int gm_set_mtu(gm_handle *h, unsigned mtu)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_mtu_nolock(h, mtu);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_mtu_nolock(gm_handle *h, unsigned mtu)
 {
     if (!h) return -1;
     if (mtu < GM_MTU_MIN || mtu > GM_MTU_MAX)
@@ -348,7 +358,16 @@ int gm_set_mtu(gm_handle *h, unsigned mtu)
 /* gm_set_frame_dup -- on the exact model of gm_set_mtu: a setter, no
  * validation beyond h != NULL (a boolean normalized to 0/1, any nonzero
  * value means "active"). */
+static int gm_set_frame_dup_nolock(gm_handle *h, int on);
 int gm_set_frame_dup(gm_handle *h, int on)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_frame_dup_nolock(h, on);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_frame_dup_nolock(gm_handle *h, int on)
 {
     if (!h) return -1;
     h->dup_enabled = on ? 1u : 0u;
@@ -360,7 +379,16 @@ int gm_set_frame_dup(gm_handle *h, int on)
  * means "active"). Padded session mode: it is gm_send_init, not this setter,
  * that negotiates the mode with the peer, through the length of the
  * CMD_INIT sent afterward. */
+static int gm_set_padding_nolock(gm_handle *h, int on);
 int gm_set_padding(gm_handle *h, int on)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_padding_nolock(h, on);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_padding_nolock(gm_handle *h, int on)
 {
     if (!h) return -1;
     const uint8_t new_mode = on ? 1u : 0u;
@@ -368,9 +396,37 @@ int gm_set_padding(gm_handle *h, int on)
      * that produced it. Changing mode clears it, otherwise a 1 -> 0 -> 1
      * toggle without gm_send_init would stick stale audio at the head of a
      * later block. */
-    if (h->padded != new_mode)
+    if (h->padded != new_mode || h->pad_headers)
         h->acarry_len = 0;
     h->padded = new_mode;
+    h->pad_headers = 0u;
+    return 0;
+}
+
+/* gm_set_padding_mode -- the three-valued form. GM_PAD_HEADERS
+ * pads the short headers only: `padded` stays the header switch, `pad_headers`
+ * tells gm_proto.c to keep the classic chunking. Any change of mode clears
+ * the audio carry, as gm_set_padding does. */
+static int gm_set_padding_mode_nolock(gm_handle *h, int mode);
+int gm_set_padding_mode(gm_handle *h, int mode)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_padding_mode_nolock(h, mode);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_padding_mode_nolock(gm_handle *h, int mode)
+{
+    if (!h) return -1;
+    if (mode != GM_PAD_OFF && mode != GM_PAD_FULL && mode != GM_PAD_HEADERS)
+        return -1;
+    const uint8_t new_padded  = mode != GM_PAD_OFF ? 1u : 0u;
+    const uint8_t new_headers = mode == GM_PAD_HEADERS ? 1u : 0u;
+    if (h->padded != new_padded || h->pad_headers != new_headers)
+        h->acarry_len = 0;
+    h->padded = new_padded;
+    h->pad_headers = new_headers;
     return 0;
 }
 
@@ -419,5 +475,6 @@ void gm_close(gm_handle *h)
     free(h->lz4_scratch);
     free(h->dup_prev[0]);
     free(h->dup_prev[1]);
+    GM_LOCK_DESTROY(&h->send_lock);
     free(h);
 }

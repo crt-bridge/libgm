@@ -39,6 +39,7 @@
 #include "gm.h"
 #include "gm_internal.h"
 #include "gm_socket.h"
+#include "gm_shard.h"
 #include "lz4.h"
 
 #ifdef _WIN32
@@ -90,10 +91,20 @@ _Static_assert(GM_SEND_ERR_SHORT == GM_SOCK_ERR_SHORT, "public and internal cons
  * drops below GM_MTU_MIN (548): compile-time guard below.
  * ------------------------------------------------------------------------- */
 #define GM_TAIL_MIN 256u
+/* A payload datagram of 6 bytes or less dies on the measured Wi-Fi and takes
+ * its large neighbour down; 7 saves. 8 = GM_PAD_LEN, one byte of margin (the
+ * reasoning of gm.h). Used by gm_lz4_compress in padded HEADERS mode. */
+#define GM_WIFI_TAIL_MIN 8u
 _Static_assert(GM_MTU_MIN >= 2u * GM_TAIL_MIN,
                "gm_next_chunk: one half of (mtu, mtu + GM_TAIL_MIN) must be at least GM_TAIL_MIN");
 _Static_assert(GM_TAIL_MIN % 4u == 0u,
                "gm_send_audio cuts GM_TAIL_MIN bytes off the end: the cut must land between two sample pairs");
+
+/* Padded HEADERS only: gm_send_audio cuts up to GM_HDR_TAIL_MIN bytes
+ * off the end of a block, rounded up to a whole 4 bytes: the buffer and the cut
+ * must stay between two sample pairs, and below the smallest MTU. */
+_Static_assert(GM_HDR_TAIL_MIN % 4u == 0u, "gm_send_audio rounds the held tail to 4 bytes");
+_Static_assert(GM_HDR_TAIL_MIN < GM_MTU_MIN, "the held tail must be smaller than a payload datagram");
 
 static int gm_emit_audio_block(gm_handle *h, const uint8_t *p, size_t bytes);
 
@@ -102,7 +113,10 @@ static size_t gm_next_chunk(const gm_handle *h, size_t remaining)
     const size_t mtu = (size_t)h->mtu;   /* session's MTU; never 0 */
     if (remaining <= mtu)
         return remaining;
-    if (h->padded && remaining - mtu < GM_TAIL_MIN)
+    /* Padded HEADERS only: the classic split. The forked MiSTer
+     * core throws the halves away; its tail is kept off the command lengths
+     * by gm_send_audio (audio) -- the video tail is not rebalanceable. */
+    if (h->padded && !h->pad_headers && remaining - mtu < GM_TAIL_MIN)
         return (remaining + 1u) / 2u;
     return mtu;
 }
@@ -328,7 +342,16 @@ static void gm_dup_reset(gm_handle *h)
  *   byte 2: sample_rate  (audio sample-rate code; 0x03 in that capture)
  *   byte 3: channels     (audio channels; 0x02 = stereo in that capture)
  * ------------------------------------------------------------------------- */
+static int gm_send_init_nolock(gm_handle *h, const gm_init_params *p);
 int gm_send_init(gm_handle *h, const gm_init_params *p)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_init_nolock(h, p);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_init_nolock(gm_handle *h, const gm_init_params *p)
 {
     if (!h || !p) {
         if (h) h->last_announce_err = GM_SEND_ERR_REFUSED;
@@ -346,6 +369,17 @@ int gm_send_init(gm_handle *h, const gm_init_params *p)
      * replaying it after a re-announce would glue audio from before the cut
      * to audio from after it. */
     h->acarry_len = 0;
+
+    /* A codec session (0x10 / 0x11) only exists in a padded session, and keeps
+     * h->compression at 0: the LZ4 path must never see a codec bitstream. */
+    const int is_codec = (p->compression == GM_CODEC_H264 || p->compression == GM_CODEC_HEVC);
+    if (is_codec && !h->padded) {
+        h->last_announce_err = GM_SEND_ERR_REFUSED;
+        return -1;
+    }
+    /* From here the handle is shared by the codec thread and the caller's thread: every public send takes the lock
+     * (gm_internal.h, send_lock). Set before the codec thread exists (it is started after this INIT returns). */
+    if (is_codec) h->send_lock_on = 1u;
 
     gm_cmd_init_t pkt;
     pkt.cmd         = CMD_INIT;
@@ -369,7 +403,18 @@ int gm_send_init(gm_handle *h, const gm_init_params *p)
     int n = gm_socket_sendto_err(h->sock, buf, len, &h->to, &h->last_announce_err);
     if (n != (int)len) return -1;
 
-    h->compression = p->compression;   /* kept for subsequent sends */
+    const uint8_t new_codec = is_codec ? (uint8_t)p->compression : 0u;
+    h->compression = is_codec ? 0u : p->compression;   /* kept for subsequent sends */
+    if (is_codec && h->codec_parity_pct == 0u) h->codec_parity_pct = 10u;
+    /* The numbering of the shards and the pending keyframe request start again ONLY when the codec of the session
+     * changes (a first codec INIT, a fall back to LZ4, another codec). A re-announce of the SAME codec in mid-session
+     * (the emitter repeats its INIT) keeps them: the receiver treats a frame number older than one it already delivered
+     * as stale, so a counter sent back to 0 loses every picture until it climbs back to where it was. */
+    if (new_codec != h->codec) {
+        h->codec_seq = 0u;
+        h->idr_pending = 0u;
+    }
+    h->codec = new_codec;
     return 0;
 }
 
@@ -387,7 +432,18 @@ int gm_send_init(gm_handle *h, const gm_init_params *p)
  * assign through &pkt.pclock as a typed pointer (UB on strict-alignment
  * ABIs). The receiver's parser does the same.
  * ------------------------------------------------------------------------- */
+static int gm_emit_native_scale(gm_handle *h);
+
+static int gm_send_switchres_nolock(gm_handle *h, const gm_modeline *m);
 int gm_send_switchres(gm_handle *h, const gm_modeline *m)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_switchres_nolock(h, m);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_switchres_nolock(gm_handle *h, const gm_modeline *m)
 {
     if (!h || !m) {
         if (h) h->last_announce_err = GM_SEND_ERR_REFUSED;
@@ -424,7 +480,185 @@ int gm_send_switchres(gm_handle *h, const gm_modeline *m)
 
     /* sizeof(pkt) is _Static_assert'd to 26 in gm.h. */
     int n = gm_socket_sendto_err(h->sock, &pkt, sizeof(pkt), &h->to, &h->last_announce_err);
-    return n == (int)sizeof(pkt) ? 0 : -1;
+    if (n != (int)sizeof(pkt)) return -1;
+
+    /* The receiver starts again at full width on every CMD_SWITCHRES: repeat
+     * the announced factors right behind it. */
+    if (h->padded && (h->native_place || h->native_kx > 1u || h->native_ky > 1u))
+        return gm_emit_native_scale(h);
+    return 0;
+}
+
+/* CMD_NATIVE_SCALE (0x09), 8 bytes: [0x09, kx, ky, 0, 0, 0, 0, 0], or
+ * CMD_NATIVE_PLACE (0x0A): [0x0A, kx, ky, w lo, w hi, h lo, h hi, 0]. */
+static int gm_emit_native_scale(gm_handle *h)
+{
+    uint8_t buf[GM_PAD_LEN];
+    memset(buf, 0, sizeof(buf));
+    buf[0] = h->native_place ? 0x0Au : 0x09u;
+    buf[1] = h->native_kx;
+    buf[2] = h->native_ky;
+    if (h->native_place) {
+        buf[3] = (uint8_t)(h->native_w & 0xFFu);
+        buf[4] = (uint8_t)(h->native_w >> 8);
+        buf[5] = (uint8_t)(h->native_h & 0xFFu);
+        buf[6] = (uint8_t)(h->native_h >> 8);
+    }
+    const int n = gm_socket_sendto_err(h->sock, buf, sizeof(buf), &h->to, &h->last_announce_err);
+    return n == (int)sizeof(buf) ? 0 : -1;
+}
+
+static int gm_resend_native_scale_nolock(gm_handle *h);
+int gm_resend_native_scale(gm_handle *h)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_resend_native_scale_nolock(h);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_resend_native_scale_nolock(gm_handle *h)
+{
+    if (!h || !h->padded ||
+        (!h->native_place && h->native_kx <= 1u && h->native_ky <= 1u)) return 0;
+    return gm_emit_native_scale(h);
+}
+
+static int gm_set_native_scale_nolock(gm_handle *h, unsigned kx, unsigned ky);
+int gm_set_native_scale(gm_handle *h, unsigned kx, unsigned ky)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_native_scale_nolock(h, kx, ky);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_native_scale_nolock(gm_handle *h, unsigned kx, unsigned ky)
+{
+    if (!h || kx < 1u || kx > 10u || ky < 1u || ky > 10u) return -1;
+    if (!h->padded) return -1;
+    const unsigned okx = h->native_kx ? h->native_kx : 1u;
+    const unsigned oky = h->native_ky ? h->native_ky : 1u;
+    if (okx == kx && oky == ky && !h->native_place) return 0;
+    h->native_kx = (uint8_t)kx;
+    h->native_ky = (uint8_t)ky;
+    h->native_place = 0;
+    h->native_w = h->native_h = 0;
+    gm_dup_reset(h);   /* the size of a frame changes: nothing to compare against */
+    return gm_emit_native_scale(h);   /* (1, 1) too: the peer must be told it is withdrawn */
+}
+
+static int gm_set_native_place_nolock(gm_handle *h, unsigned kx, unsigned ky, unsigned w, unsigned hh);
+int gm_set_native_place(gm_handle *h, unsigned kx, unsigned ky, unsigned w, unsigned hh)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_native_place_nolock(h, kx, ky, w, hh);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_native_place_nolock(gm_handle *h, unsigned kx, unsigned ky, unsigned w, unsigned hh)
+{
+    if (!h || kx < 1u || kx > 10u || ky < 1u || ky > 10u || w < 1u || w > 0xFFFFu ||
+        hh < 1u || hh > 0xFFFFu)
+        return -1;
+    if (!h->padded) return -1;
+    if (h->native_place && h->native_kx == kx && h->native_ky == ky &&
+        h->native_w == w && h->native_h == hh)
+        return 0;
+    h->native_kx = (uint8_t)kx;
+    h->native_ky = (uint8_t)ky;
+    h->native_place = 1u;
+    h->native_w = (uint16_t)w;
+    h->native_h = (uint16_t)hh;
+    gm_dup_reset(h);
+    return gm_emit_native_scale(h);
+}
+
+/* --- Codec session: one frame as shards --------------------------------------- */
+static int gm_set_codec_parity_nolock(gm_handle *h, unsigned pct);
+int gm_set_codec_parity(gm_handle *h, unsigned pct)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_set_codec_parity_nolock(h, pct);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_set_codec_parity_nolock(gm_handle *h, unsigned pct)
+{
+    if (!h || pct > 100u) return -1;
+    h->codec_parity_pct = (uint8_t)pct;
+    return 0;
+}
+
+static int gm_shard_emit_dgram(void *user, const uint8_t *dgram, size_t len)
+{
+    gm_handle *h = (gm_handle *)user;
+    return gm_socket_sendto(h->sock, dgram, len, &h->to) == (int)len ? 0 : -1;
+}
+
+static int gm_send_codec_frame_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                        const uint8_t *bitstream, size_t len, int keyframe);
+int gm_send_codec_frame(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                        const uint8_t *bitstream, size_t len, int keyframe)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_codec_frame_nolock(h, frame_id, vsync, bitstream, len, keyframe);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_codec_frame_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                        const uint8_t *bitstream, size_t len, int keyframe)
+{
+    uint8_t hdr[11];
+    const uint32_t csize = (uint32_t)len;
+    if (!h || !h->codec || !h->padded || (len > 0u && !bitstream)) return -1;
+    /* The Groovy header goes first, as for any image: the frame id and the vsync
+     * travel as before, the size field says how many bytes of bitstream follow. */
+    hdr[0] = CMD_BLIT_VSYNC;
+    memcpy(&hdr[1], &frame_id, sizeof(uint32_t));
+    memcpy(&hdr[5], &vsync,    sizeof(uint16_t));
+    memcpy(&hdr[7], &csize,    sizeof(uint32_t));
+    if (gm_socket_sendto(h->sock, hdr, sizeof(hdr), &h->to) != (int)sizeof(hdr)) return -1;
+    /* The shards are numbered by their own consecutive counter, not by frame_id: a picture the
+     * emitter drops before encoding leaves a hole in frame_id but none in the stream. */
+    return gm_shard_send_ex(bitstream, len, h->codec_seq++, frame_id, vsync,
+                            keyframe ? GM_SHARD_F_KEY : 0u, (unsigned)h->mtu,
+                            h->codec_parity_pct, gm_shard_emit_dgram, h);
+}
+
+static int gm_codec_idr_requested_nolock(gm_handle *h);
+int gm_codec_idr_requested(gm_handle *h)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_codec_idr_requested_nolock(h);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_codec_idr_requested_nolock(gm_handle *h)
+{
+    int r;
+    if (!h || !h->codec) return 0;
+    r = h->idr_pending ? 1 : 0;
+    h->idr_pending = 0;
+    return r;
+}
+
+unsigned gm_peer_codecs(const gm_handle *h)
+{
+    unsigned r = 0u;
+    if (!h || !h->padded || !h->has_status) return 0u;
+    if (h->last_status.flags & FLAG_CODEC_H264) r |= 1u;
+    if (h->last_status.flags & FLAG_CODEC_HEVC) r |= 2u;
+    return r;
+}
+
+int gm_peer_native_ok(const gm_handle *h)
+{
+    return h && h->padded && h->has_status && (h->last_status.flags & 0x80u) ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -469,6 +703,30 @@ static const uint8_t *gm_lz4_compress(gm_handle *h, const uint8_t *src,
                                        (char *)h->lz4_scratch,
                                        (int)bytes, bound);
     if (written <= 0) return NULL;
+
+    /* Padded HEADERS only: never a frame whose last datagram is
+     * 1..GM_WIFI_TAIL_MIN-1 bytes. Measured on the SuperStation's Wi-Fi, in
+     * the core's own log: every one of 106 lost frames ended in a tail of 1 to
+     * 6 bytes, and none in a longer one -- the tail dies and takes the large
+     * datagram next to it. This mode cannot rebalance the last two chunks (the
+     * forked core throws away a non-final datagram under 1472 bytes), and the
+     * compressed bytes cannot be padded (LZ4 would read them as a sequence).
+     * What can change is the compressed SIZE: the same frame compressed at
+     * another acceleration is a valid LZ4 block of another length. Tried a few
+     * times (a bad tail is 0.5 % of frames, so one retry nearly always
+     * lands); if none does, the first block goes out as it is. The classic and
+     * the full padded modes are untouched: the wire stays bit-identical. */
+    if (h->pad_headers) {
+        const size_t mtu = (size_t)h->mtu;
+        size_t tail = (size_t)written % mtu;
+        for (int accel = 2; tail != 0u && tail < GM_WIFI_TAIL_MIN && accel <= 12; accel++) {
+            const int w2 = LZ4_compress_fast((const char *)src, (char *)h->lz4_scratch,
+                                             (int)bytes, bound, accel);
+            if (w2 <= 0) return NULL;
+            written = w2;
+            tail    = (size_t)written % mtu;
+        }
+    }
 
     *out_size = (uint32_t)written;
     return h->lz4_scratch;
@@ -665,10 +923,21 @@ static int gm_emit_blit_0x06(gm_handle *h, uint32_t frame_id, uint16_t vsync,
     return gm_send_payload(h, payload, bytes);
 }
 
+static int gm_send_blit_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                 const uint8_t *rgb888, size_t bytes);
 int gm_send_blit(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                  const uint8_t *rgb888, size_t bytes)
 {
-    if (!h) return -1;
+    const int took = gm_lock_take(h);
+    const int r = gm_send_blit_nolock(h, frame_id, vsync, rgb888, bytes);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_blit_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                 const uint8_t *rgb888, size_t bytes)
+{
+    if (!h || h->codec) return -1;   /* a codec session sends gm_send_codec_frame */
     if (bytes > 0 && !rgb888) return -1;
 
     /* Frame-dup, unchanged: the decision is made BEFORE compression — a
@@ -710,10 +979,21 @@ int gm_send_blit(gm_handle *h, uint32_t frame_id, uint16_t vsync,
  *       half-frames at the deadline, so that an ENTIRE image (both
  *       parities) gets refreshed, never just one half.
  * ------------------------------------------------------------------------- */
+static int gm_send_blit_half_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                      uint8_t field, const uint8_t *rgb888, size_t bytes);
 int gm_send_blit_half(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                       uint8_t field, const uint8_t *rgb888, size_t bytes)
 {
-    if (!h) return -1;
+    const int took = gm_lock_take(h);
+    const int r = gm_send_blit_half_nolock(h, frame_id, vsync, field, rgb888, bytes);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_blit_half_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                      uint8_t field, const uint8_t *rgb888, size_t bytes)
+{
+    if (!h || h->codec) return -1;
     if (field > 1u) return -1;
     if (bytes > 0 && !rgb888) return -1;
 
@@ -772,7 +1052,18 @@ int gm_send_blit_half(gm_handle *h, uint32_t frame_id, uint16_t vsync,
  * session's MTU, NO opcode prefix on continuation datagrams (the receiver's
  * continuation guard reassembles each field).
  * ------------------------------------------------------------------------- */
+static int gm_send_blit_field_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                       uint8_t field, const uint8_t *rgb888, size_t bytes);
 int gm_send_blit_field(gm_handle *h, uint32_t frame_id, uint16_t vsync,
+                       uint8_t field, const uint8_t *rgb888, size_t bytes)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_blit_field_nolock(h, frame_id, vsync, field, rgb888, bytes);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_blit_field_nolock(gm_handle *h, uint32_t frame_id, uint16_t vsync,
                        uint8_t field, const uint8_t *rgb888, size_t bytes)
 {
     if (!h) return -1;
@@ -851,7 +1142,18 @@ int gm_send_blit_field(gm_handle *h, uint32_t frame_id, uint16_t vsync,
  * `struct record_audio_data` on the RetroArch side, and keeping it here
  * avoids one more conversion at the call site.
  * ------------------------------------------------------------------------- */
+static int gm_send_audio_nolock(gm_handle *h, const int16_t *pcm, size_t frames,
+                  uint8_t channels);
 int gm_send_audio(gm_handle *h, const int16_t *pcm, size_t frames,
+                  uint8_t channels)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_audio_nolock(h, pcm, frames, channels);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_audio_nolock(gm_handle *h, const int16_t *pcm, size_t frames,
                   uint8_t channels)
 {
     if (!h) return -1;
@@ -872,6 +1174,40 @@ int gm_send_audio(gm_handle *h, const int16_t *pcm, size_t frames,
      * Unreachable from record_groovy.c (at most 32768 bytes per call),
      * covered by a test. */
     const uint8_t *p = (const uint8_t *)pcm;
+    if (h->pad_headers) {
+        /* Padded HEADERS only. Never a block that ends in 1..31
+         * bytes: the forked core reads a datagram of up to 26 bytes as a
+         * command. The last bytes of the block (rounded up to a whole
+         * 4 bytes, at most GM_HDR_TAIL_MIN) are held in h->acarry and glued
+         * to the FRONT of the next block; a block that is all tail is held
+         * whole. Sample order is preserved. The carry is lost at gm_send_init
+         * and at close, as in the full padded mode: at most 32 bytes. */
+        const size_t cap = 32768u;   /* + carry <= 32 : fits acarry[65536] and the u16 */
+        if (bytes > cap) {
+            const size_t f1 = frames / 2u;
+            if (gm_send_audio(h, pcm, f1, channels) != 0) return -1;
+            return gm_send_audio(h, pcm + f1 * channels, frames - f1, channels);
+        }
+        if (h->acarry_len > 0) {
+            if (bytes > 0) memcpy(h->acarry + h->acarry_len, p, bytes);
+            bytes += h->acarry_len;
+            p = h->acarry;
+            h->acarry_len = 0;
+        }
+        const size_t rem = bytes % (size_t)h->mtu;
+        if (rem != 0 && rem < GM_HDR_TAIL_MIN) {
+            size_t hold = (rem + 3u) & ~(size_t)3u;
+            if (hold > bytes) hold = bytes;
+            uint8_t keep[GM_HDR_TAIL_MIN];
+            memcpy(keep, p + bytes - hold, hold);
+            bytes -= hold;
+            const int rc = bytes > 0 ? gm_emit_audio_block(h, p, bytes) : 0;
+            memcpy(h->acarry, keep, hold);
+            h->acarry_len = hold;
+            return rc;
+        }
+        return gm_emit_audio_block(h, p, bytes);
+    }
     if (h->padded) {
         if (h->acarry_len + bytes < GM_TAIL_MIN) {
             if (bytes > 0) memcpy(h->acarry + h->acarry_len, p, bytes);
@@ -938,7 +1274,16 @@ static int gm_emit_audio_block(gm_handle *h, const uint8_t *p, size_t bytes)
 /* ---------------------------------------------------------------------------
  * gm_send_close — CMD_CLOSE (0x01), single-byte teardown packet.
  * ------------------------------------------------------------------------- */
+static int gm_send_close_nolock(gm_handle *h);
 int gm_send_close(gm_handle *h)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_close_nolock(h);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_close_nolock(gm_handle *h)
 {
     if (!h) return -1;
     /* Padded-session mode: same pattern as gm_send_init/gm_send_audio — a
@@ -1005,11 +1350,23 @@ int gm_recv_status(gm_handle *h, gm_status *out, int timeout_ms)
     memcpy(&out->vcount,      wire_buf + 10, sizeof(uint16_t));  /* bytes 10-11 */
     out->flags = wire_buf[12];                                     /* byte  12   */
 
+    const int took = gm_lock_take(h);   /* the cache and the keyframe counter are read by gm_codec_idr_requested and gm_send_init */
+    /* Codec session: bytes 10-11 (the receiver's scan line counter, meaningless to a software client) carry the
+     * client's KEYFRAME REQUEST COUNTER. It moves each time the client lost its reference; a counter survives
+     * a lost status, which a one-shot bit would not. The first status only sets the baseline. */
+    if (h->codec) {
+        uint16_t ctr;
+        memcpy(&ctr, wire_buf + 10, sizeof ctr);
+        if (!h->has_status) h->idr_seen = ctr;
+        else if (ctr != h->idr_seen) { h->idr_seen = ctr; h->idr_pending = 1; }
+    }
+
     /* Cache for caller-side staleness checks. */
     h->last_status = *out;
     h->has_status  = 1;
     h->last_status_from = from;
     h->has_status_from  = 1;
+    gm_lock_drop(h, took);
 
     return 0;
 }
@@ -1020,7 +1377,16 @@ int gm_recv_status(gm_handle *h, gm_status *out, int timeout_ms)
  * Internal helper for the heartbeat thread (gm_heartbeat.c). Not in the
  * public API. Declaration lives in gm_internal.h.
  * ------------------------------------------------------------------------- */
+static int gm_send_get_status_internal_nolock(gm_handle *h);
 int gm_send_get_status_internal(gm_handle *h)
+{
+    const int took = gm_lock_take(h);
+    const int r = gm_send_get_status_internal_nolock(h);
+    gm_lock_drop(h, took);
+    return r;
+}
+
+static int gm_send_get_status_internal_nolock(gm_handle *h)
 {
     if (!h) return -1;
     /* Padded-session mode: `05` then seven zeros in padded mode. Padding
@@ -1032,6 +1398,54 @@ int gm_send_get_status_internal(gm_handle *h)
     pkt[0] = CMD_GET_STATUS;  /* 0x05 */
     size_t len = h->padded ? (size_t)GM_PAD_LEN : 1u;
     return gm_socket_sendto(h->sock, pkt, len, &h->to) == (int)len ? 0 : -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * gm_probe_peer — what does the peer answer to CMD_GET_VERSION?
+ *
+ * One byte, 0x08, sent ALONE (never behind a frame: on the measured Wi-Fi a
+ * small datagram that follows a frame in the same burst dies, an isolated one
+ * passes 199 times in 200). A request that dies is repeated, up to `tries`.
+ *
+ * Replies, by shape only:
+ *   `01 43 42 <rev> ...`  the MiSTer core forked for padded headers
+ *   1 byte                the original MiSTer core (GroovyMister answers `01`)
+ *   13 bytes              the crt-bridge receiver's status: not a MiSTer
+ * Anything else, and anything from another host, is read and ignored.
+ * Called before gm_send_init, while nothing else flows on the socket.
+ * ------------------------------------------------------------------------- */
+int gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev)
+{
+    if (!h) return -1;
+    if (rev) *rev = 0u;
+    if (tries < 1) tries = 1;
+    if (timeout_ms < 1) timeout_ms = 1;
+
+    for (int t = 0; t < tries; t++) {
+        const uint8_t req = CMD_GET_VERSION;
+        if (gm_socket_sendto(h->sock, &req, 1u, &h->to) != 1)
+            continue;
+        for (int reads = 0; reads < 4; reads++) {   /* bounds the wait if foreign traffic keeps arriving */
+            uint8_t buf[64];
+            struct sockaddr_in from;
+            memset(&from, 0, sizeof(from));
+            const int n = gm_socket_recvfrom_timeout_from(h->sock, buf, sizeof(buf),
+                                                          timeout_ms, &from);
+            if (n <= 0) break;                       /* timeout: send again */
+            if (h->to.sin_addr.s_addr != 0 && from.sin_addr.s_addr != h->to.sin_addr.s_addr)
+                continue;                            /* not the peer */
+            /* The 13-byte status comes FIRST: its first four bytes are the
+             * receiver's frame_echo, which can be `01 43 42 xx` after about
+             * twenty hours of play. The forked core answers on 8 bytes. */
+            if (n == 13) return GM_PEER_UNKNOWN;     /* a crt-bridge status */
+            if (n >= 4 && buf[0] == 0x01u && buf[1] == 0x43u && buf[2] == 0x42u) {
+                if (rev) *rev = (unsigned)buf[3];
+                return GM_PEER_PADDED;
+            }
+            if (n == 1) return GM_PEER_STOCK;
+        }
+    }
+    return GM_PEER_UNKNOWN;
 }
 
 /* ---------------------------------------------------------------------------

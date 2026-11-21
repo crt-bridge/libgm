@@ -115,6 +115,48 @@ struct gm_handle {
      * value). --- */
     uint8_t            padded;
 
+    /* --- Padded HEADERS only: set together with `padded`. The four
+     * short headers are padded, but gm_next_chunk is the classic split and
+     * gm_send_audio holds back a tail under GM_HDR_TAIL_MIN instead of
+     * GM_TAIL_MIN. 0 in every other mode; calloc leaves 0. --- */
+    uint8_t            pad_headers;
+
+    /* --- Native-width contract (CMD_NATIVE_SCALE, 0x09), padded session only.
+     * The factors the caller announced with gm_set_native_scale; 0 = none
+     * (calloc: wire bit-identical to before the feature). The receiver starts
+     * again at full width on EVERY CMD_SWITCHRES, so gm_send_switchres repeats
+     * the 0x09 right after its own datagram. --- */
+    uint8_t            native_kx, native_ky;
+    /* CMD_NATIVE_PLACE (0x0A), same session: the size of the picture as it
+     * travels, announced with gm_set_native_place. native_place != 0 means
+     * the 0x0A is the announcement in force (and not the 0x09). */
+    uint8_t            native_place;
+    uint16_t           native_w, native_h;
+
+    /* --- The send lock of a CODEC session. A codec session is the one case where two threads use one handle: the
+     * codec thread sends the pictures (gm_send_codec_frame: a 0x06 header and its shards), the main thread sends
+     * SWITCHRES, INIT, audio and reads statuses. Their datagrams must not interleave (an audio block is a header
+     * followed by opcode-less payload datagrams: a shard in between is swallowed as audio, and the frame loses a
+     * shard), and gm_send_init resets codec_seq while the codec thread increments it. So every public send, and the
+     * setters that touch the same state, take this lock -- but ONLY once the handle is in a codec session
+     * (send_lock_on, set by gm_send_init for compression 0x10 / 0x11): every other session pays one load and one
+     * branch, and its wire is byte for byte the same. Recursive: the public sends call one another. --- */
+    gm_lock_t          send_lock;
+    uint8_t            send_lock_on;
+
+    /* --- Codec session (phase 36): CMD_INIT compression 0x10 (H.264) / 0x11
+     * (HEVC), padded session only. 0 = none (calloc: the wire is bit-identical
+     * to before). h->compression stays 0 in such a session: the LZ4 path must
+     * never touch a codec bitstream. codec_parity_pct = Reed-Solomon parity
+     * added to every frame, in percent of its data shards. --- */
+    uint8_t            codec;
+    uint8_t            codec_parity_pct;
+    uint16_t           idr_seen;       /* the client's request counter (status bytes 10-11) as last read */
+    uint8_t            idr_pending;    /* it moved: the client wants a keyframe */
+    uint16_t           codec_seq;      /* number of the next codec frame ON THE WIRE (shard frame_id): consecutive, so
+                                        * that a hole means a frame lost in transit and not a picture the emitter chose
+                                        * to skip. The Groovy frame_id travels in the 0x06 header. */
+
     /* --- Holding back of VERY SMALL audio blocks, padded mode only. An
      * entire block shorter than GM_TAIL_MIN bytes cannot be rebalanced by
      * gm_next_chunk: it would go out as a small datagram glued to its short
@@ -199,6 +241,24 @@ struct gm_handle {
  * always the segment ACTUALLY requested, never calloc's 0. Defined in gm.c,
  * also called by gm_flush_run (gm_proto.c). */
 void gm_uso_disarm(gm_handle *h);
+
+/* Takes the send lock when the handle is in a codec session; returns 1 if it did (give that back to gm_lock_drop).
+ * GM_TEST_NO_SEND_LOCK (a test build only) turns it off, to show the stress test fails without it. */
+static inline int gm_lock_take(gm_handle *h)
+{
+#ifdef GM_TEST_NO_SEND_LOCK
+    (void)h;
+    return 0;
+#else
+    if (!h || !h->send_lock_on) return 0;
+    GM_LOCK_TAKE(&h->send_lock);
+    return 1;
+#endif
+}
+static inline void gm_lock_drop(gm_handle *h, int took)
+{
+    if (took) GM_LOCK_DROP(&h->send_lock);
+}
 
 /* Internal helper: send a 1-byte CMD_GET_STATUS (0x05) poll packet.
  * Called by the heartbeat thread in gm_heartbeat.c. Not part of public API.

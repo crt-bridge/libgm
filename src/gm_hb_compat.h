@@ -38,4 +38,30 @@ typedef atomic_int gm_hb_flag;
 #  define GM_HB_FLAG_GET(p)     atomic_load((p))
 #endif
 
+/* ---------------------------------------------------------------------------
+ * gm_lock_t -- the per-handle RECURSIVE lock of a codec session (see gm_internal.h, send_lock). Recursive because
+ * the public gm_send_* call one another (gm_send_audio splits a large block by calling itself).
+ * ------------------------------------------------------------------------- */
+#ifdef _WIN32
+typedef CRITICAL_SECTION gm_lock_t;                  /* a Win32 critical section is recursive */
+#  define GM_LOCK_INIT(l)     InitializeCriticalSection(l)
+#  define GM_LOCK_TAKE(l)     EnterCriticalSection(l)
+#  define GM_LOCK_DROP(l)     LeaveCriticalSection(l)
+#  define GM_LOCK_DESTROY(l)  DeleteCriticalSection(l)
+#else
+typedef pthread_mutex_t gm_lock_t;
+static inline void gm_lock_init_recursive(gm_lock_t *l)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(l, &a);
+    pthread_mutexattr_destroy(&a);
+}
+#  define GM_LOCK_INIT(l)     gm_lock_init_recursive(l)
+#  define GM_LOCK_TAKE(l)     pthread_mutex_lock(l)
+#  define GM_LOCK_DROP(l)     pthread_mutex_unlock(l)
+#  define GM_LOCK_DESTROY(l)  pthread_mutex_destroy(l)
+#endif
+
 #endif /* LIBGM_GM_HB_COMPAT_H */

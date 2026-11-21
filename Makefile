@@ -35,7 +35,7 @@ else
 endif
 endif
 
-LIB_SRCS = src/gm_socket.c src/gm.c src/gm_proto.c src/gm_heartbeat.c src/gm_input.c src/lz4.c
+LIB_SRCS = src/gm_socket.c src/gm.c src/gm_proto.c src/gm_heartbeat.c src/gm_input.c src/gm_shard.c src/lz4.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 LIB      = libgm.a
 DLL      = libgm.dll
@@ -55,7 +55,7 @@ src/lz4.o: CFLAGS += -Wno-conversion -Wno-sign-conversion -Wno-pedantic
 # last_status_from/has_status_from were added). The implicit %.o rule carried
 # NO dependency on the shared headers: `make` only recompiled the modified .c
 # file. Same lesson as BRIDGE_HDRS below, applied here to the library itself.
-LIB_HDRS = include/gm.h src/gm_internal.h src/gm_socket.h src/gm_hb_compat.h src/lz4.h
+LIB_HDRS = include/gm.h src/gm_internal.h src/gm_socket.h src/gm_hb_compat.h src/gm_shard.h src/lz4.h
 $(LIB_OBJS): $(LIB_HDRS)
 
 SMOKE_SRC = test/libgm_smoke.c
@@ -120,7 +120,7 @@ PROBE_PARSER = $(wildcard $(RECEIVER_SRC)/proto.c)
 # test suite.
 USO_TEST_SRC  = test/test_uso_fallback.c
 USO_TEST_BIN  = test_uso_fallback.exe
-USO_TEST_OBJS = src/gm.o src/gm_proto.o src/gm_heartbeat.o src/gm_input.o src/lz4.o
+USO_TEST_OBJS = src/gm.o src/gm_proto.o src/gm_heartbeat.o src/gm_input.o src/gm_shard.o src/lz4.o
 
 # test_connreset -- a datagram sent to a closed port must not
 # leave a WSAECONNRESET queued ahead of the late peer's status or input
@@ -184,6 +184,46 @@ $(USO_TEST_BIN): $(USO_TEST_SRC) src/gm_socket.c $(LIB_HDRS) $(USO_TEST_OBJS)
 $(CONNRESET_TEST_BIN): $(CONNRESET_TEST_SRC) $(LIB_HDRS) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $(CONNRESET_TEST_SRC) $(LIB) $(LDFLAGS)
 
+# The H.264 fixtures of the codec tests, made from a synthetic test pattern (test/fixtures/make_h264_fixtures.py). They are
+# regenerated ONLY when missing (an order-only prerequisite below): `make fixtures` forces it. Needs an ffmpeg built with libx264
+# (FFMPEG=...). Without it the tests that read them SKIP loudly (exit 77), never pass silently.
+FFMPEG   ?= ffmpeg
+PYTHON   ?= python3
+FIXTURES_DIR = test/fixtures
+FIXTURE_BINS = $(FIXTURES_DIR)/synthetic-h264-444-368x480-60.bin $(FIXTURES_DIR)/synthetic-h264-444-368x480-60-key10.bin $(FIXTURES_DIR)/synthetic-h264-444-320x240-30.bin
+
+.PHONY: fixtures
+fixtures:
+	$(PYTHON) -I $(FIXTURES_DIR)/make_h264_fixtures.py --ffmpeg "$(FFMPEG)" --outdir $(FIXTURES_DIR)
+
+$(FIXTURE_BINS):
+	@$(PYTHON) -I $(FIXTURES_DIR)/make_h264_fixtures.py --ffmpeg "$(FFMPEG)" --outdir $(FIXTURES_DIR) 	  || echo "fixtures not made (an ffmpeg with libx264 is needed: FFMPEG=...): the tests that read them will SKIP"
+
+# test_shard_burst -- the transport under burst losses: the table that decides the default parity.
+test_shard_burst: test/test_shard_burst.c $(LIB_HDRS) $(LIB) | $(FIXTURE_BINS)
+	$(CC) $(CFLAGS) -o $@ test/test_shard_burst.c $(LIB) $(LDFLAGS)
+
+# test_shard -- the codec session transport (shards, Reed-Solomon parity), loopback port 42411.
+test_shard: test/test_shard.c $(LIB_HDRS) $(LIB) | $(FIXTURE_BINS)
+	$(CC) $(CFLAGS) -o $@ test/test_shard.c $(LIB) $(LDFLAGS)
+
+# test_send_lock -- the codec thread and the caller's thread on ONE handle (the send lock of a codec session), loopback
+# port 42433. test_send_lock_nolock is the same test with the lock compiled out: it must FAIL (it is the proof that this
+# test can see the defect); `test-send-lock-mutant` runs it up to five times and demands one failure.
+test_send_lock: test/test_send_lock.c $(LIB_HDRS) $(LIB)
+	$(CC) $(CFLAGS) -pthread -o $@ test/test_send_lock.c $(LIB) $(LDFLAGS)
+
+test_send_lock_nolock: test/test_send_lock.c $(LIB_HDRS) $(LIB_SRCS)
+	$(CC) $(CFLAGS) -pthread -DGM_TEST_NO_SEND_LOCK -o $@ test/test_send_lock.c $(LIB_SRCS) $(LDFLAGS)
+
+.PHONY: test-send-lock-mutant
+test-send-lock-mutant: test_send_lock_nolock
+	@for i in 1 2 3 4 5; do ./test_send_lock_nolock >/dev/null 2>&1 || { echo "mutant (no lock) fails, as it must (run $$i)"; exit 0; }; done; 	  echo "ERROR: the test passes WITHOUT the lock: it cannot see the defect"; exit 1
+
+# test_native_scale -- CMD_NATIVE_SCALE (0x09) on the wire, loopback port 42410.
+test_native_scale: test/test_native_scale.c $(LIB_HDRS) $(LIB)
+	$(CC) $(CFLAGS) -o $@ test/test_native_scale.c $(LIB) $(LDFLAGS)
+
 $(SEQ_TEST_BIN): $(SEQ_TEST_SRC) src/gm_seq.h
 	$(CC) $(CFLAGS) -o $@ $(SEQ_TEST_SRC)
 
@@ -216,8 +256,12 @@ $(PROBE_DLL):
 endif
 
 ifeq ($(GM_POSIX),1)
-test: $(SELECT_TEST_BIN)
+test: $(SELECT_TEST_BIN) test_native_scale test_shard test_shard_burst test_send_lock test-send-lock-mutant
 	./$(SELECT_TEST_BIN)
+	./test_native_scale
+	./test_shard
+	./test_shard_burst
+	./test_send_lock
 else
 test: $(SMOKE_BIN) $(SELECT_TEST_BIN) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN)
 	./$(SELECT_TEST_BIN)
@@ -229,4 +273,4 @@ endif
 clean:
 	rm -f $(LIB) $(DLL) libgm.dll.a $(LIB_OBJS) $(SMOKE_BIN) $(INPUT_SMOKE_BIN) \
 	    $(BRIDGE_DLL) $(BRIDGE_DLL).a $(PROBE_DLL) $(PROBE_DLL).a $(SELECT_TEST_BIN) \
-	    $(SEQ_TEST_BIN) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN)
+	    $(SEQ_TEST_BIN) $(USO_TEST_BIN) $(CONNRESET_TEST_BIN) test_send_lock test_send_lock_nolock
