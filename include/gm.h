@@ -319,7 +319,7 @@ int      gm_set_frame_dup(gm_handle *h, int on);
  * | CMD_GET_STATUS 0x05            | 1: `05`                  | 8: `05 00 00 00 00 00 00 00`            | 7 zeros |
  * | CMD_BLIT_VSYNC 0x06            | 11                       | 11, UNCHANGED                           | --      |
  * | CMD_BLIT_FIELD_VSYNC 0x07      | 8 / 9 / 12               | UNCHANGED                               | --      |
- * | CMD_GET_VERSION 0x08           | 1                        | 1, UNCHANGED (gm_probe_peer only)       | --      |
+ * | CMD_GET_VERSION 0x08           | 1                        | 1, then 8 if unanswered (probe only)    | --      |
  *
  * PAYLOADS (PCM chunks, image chunks) are NEVER padded -- only the small
  * command header is; padding a payload would throw off the receiver's
@@ -329,9 +329,9 @@ int      gm_set_frame_dup(gm_handle *h, int on);
  * audio), and a WHOLE audio block under 256 bytes is held back and glued
  * to the front of the next one. The one accepted exception: a WHOLE image
  * under 256 bytes goes out as-is. See gm_next_chunk.
- * CMD_GET_VERSION is sent only by gm_probe_peer, always as the
- * original single byte: a 1-byte datagram sent alone passes on the measured
- * Wi-Fi, and the probe repeats it.
+ * CMD_GET_VERSION is sent only by gm_probe_peer, first as the original
+ * single byte (a 1-byte datagram sent alone passes on the measured Wi-Fi,
+ * and the probe repeats it), then in the padded form if nothing answered.
  *
  * ABSENT setting = BIT-IDENTICAL wire: without this call, gm_send_init and
  * the three other short emitters (gm_send_audio, gm_send_close,
@@ -383,20 +383,25 @@ int      gm_set_padding(gm_handle *h, int on);
 int      gm_set_padding_mode(gm_handle *h, int mode);
 
 /* What a peer answers to CMD_GET_VERSION (0x08), sent alone, 1 byte:
- *   GM_PEER_UNKNOWN  no answer, or an answer of another shape (the crt-bridge
- *                    receiver answers with its 13-byte status) -- change nothing
- *   GM_PEER_STOCK    exactly 1 byte: the original Groovy core. Its AUDIO
- *                    header is 3 bytes and dies on a Wi-Fi link
- *   GM_PEER_PADDED   `01 43 42 <revision> ...`: the core forked for padded
- *                    headers. *rev gets the revision byte; never compare it
- *                    for equality, a later revision is still capable.
- * Sends up to `tries` requests, waiting `timeout_ms` after each; a request
- * that dies on the way is simply repeated. Consumes the datagrams it reads
- * (a status ack read here is not replayed). Returns one of the three values,
+ *   GM_PEER_UNKNOWN    no answer, or an answer of another shape
+ *   GM_PEER_STOCK      exactly 1 byte: the original Groovy core. Its AUDIO
+ *                      header is 3 bytes and dies on a Wi-Fi link
+ *   GM_PEER_PADDED     `01 43 42 <revision> ...`: the core forked for padded
+ *                      headers. *rev gets the revision byte; never compare it
+ *                      for equality, a later revision is still capable.
+ *   GM_PEER_CRTBRIDGE  exactly 13 bytes: the crt-bridge receiver answers with
+ *                      its status. Tested FIRST: a status whose frame_echo
+ *                      reads `01 43 42 xx` is never taken for a forked core.
+ * Sends up to `tries` requests of one byte, waiting `timeout_ms` after each; a
+ * request that dies on the way is simply repeated. Without any answer, two
+ * more requests in the padded form (8 bytes): a crt-bridge receiver left in a
+ * padded session only reads that one. Consumes the datagrams it reads
+ * (a status ack read here is not replayed). Returns one of the four values,
  * or -1 if h is NULL. */
 #define GM_PEER_UNKNOWN    0
 #define GM_PEER_STOCK      1
 #define GM_PEER_PADDED     2
+#define GM_PEER_CRTBRIDGE  3
 int      gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev);
 
 /* Number of frame_dup packets emitted since the session opened. A

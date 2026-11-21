@@ -1410,10 +1410,30 @@ static int gm_send_get_status_internal_nolock(gm_handle *h)
  * Replies, by shape only:
  *   `01 43 42 <rev> ...`  the MiSTer core forked for padded headers
  *   1 byte                the original MiSTer core (GroovyMister answers `01`)
- *   13 bytes              the crt-bridge receiver's status: not a MiSTer
+ *   13 bytes              the crt-bridge receiver's status (GM_PEER_CRTBRIDGE)
  * Anything else, and anything from another host, is read and ignored.
+ *
+ * A peer that answered nothing to the single byte is asked twice more with
+ * the padded form (8 bytes, GM_PAD_LEN): a crt-bridge receiver still in a
+ * padded session from an emitter that never closed it only reads that form.
+ * A MiSTer core answers the single byte, so it never sees the padded one.
  * Called before gm_send_init, while nothing else flows on the socket.
  * ------------------------------------------------------------------------- */
+#define GM_PROBE_PADDED_TRIES 2
+#define GM_PROBE_DRAIN_MAX    16
+
+/* An answer to an earlier request may still be on its way when the probe
+ * returns: read away, without waiting, what is already there, so that the
+ * first gm_recv_status after CMD_INIT never takes it for a status. */
+static void gm_probe_drain(gm_handle *h)
+{
+    for (int i = 0; i < GM_PROBE_DRAIN_MAX; i++) {
+        uint8_t buf[64];
+        if (gm_socket_recvfrom_timeout_from(h->sock, buf, sizeof(buf), 0, NULL) <= 0)
+            return;
+    }
+}
+
 int gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev)
 {
     if (!h) return -1;
@@ -1421,28 +1441,40 @@ int gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev)
     if (tries < 1) tries = 1;
     if (timeout_ms < 1) timeout_ms = 1;
 
-    for (int t = 0; t < tries; t++) {
-        const uint8_t req = CMD_GET_VERSION;
-        if (gm_socket_sendto(h->sock, &req, 1u, &h->to) != 1)
-            continue;
-        for (int reads = 0; reads < 4; reads++) {   /* bounds the wait if foreign traffic keeps arriving */
+    for (int t = 0; t < tries + GM_PROBE_PADDED_TRIES; t++) {
+        uint8_t        req[GM_PAD_LEN];
+        const size_t   len      = (t < tries) ? 1u : (size_t)GM_PAD_LEN;
+        const uint64_t deadline = gm_mono_ns() + (uint64_t)timeout_ms * 1000000ull;
+
+        memset(req, 0, sizeof(req));
+        req[0] = CMD_GET_VERSION;
+        /* A send that fails (network not ready) still waits its turn below:
+         * the tries are spread over time, never spent in a burst. */
+        (void)gm_socket_sendto(h->sock, req, len, &h->to);
+        /* One deadline per try, whatever arrives: foreign traffic cannot
+         * stretch the wait. */
+        for (;;) {
+            const uint64_t now = gm_mono_ns();
+            if (now >= deadline) break;
+            const int left_ms = (int)((deadline - now + 999999ull) / 1000000ull);
             uint8_t buf[64];
             struct sockaddr_in from;
             memset(&from, 0, sizeof(from));
             const int n = gm_socket_recvfrom_timeout_from(h->sock, buf, sizeof(buf),
-                                                          timeout_ms, &from);
+                                                          left_ms, &from);
             if (n <= 0) break;                       /* timeout: send again */
             if (h->to.sin_addr.s_addr != 0 && from.sin_addr.s_addr != h->to.sin_addr.s_addr)
                 continue;                            /* not the peer */
             /* The 13-byte status comes FIRST: its first four bytes are the
              * receiver's frame_echo, which can be `01 43 42 xx` after about
              * twenty hours of play. The forked core answers on 8 bytes. */
-            if (n == 13) return GM_PEER_UNKNOWN;     /* a crt-bridge status */
+            if (n == 13) { gm_probe_drain(h); return GM_PEER_CRTBRIDGE; }
             if (n >= 4 && buf[0] == 0x01u && buf[1] == 0x43u && buf[2] == 0x42u) {
                 if (rev) *rev = (unsigned)buf[3];
+                gm_probe_drain(h);
                 return GM_PEER_PADDED;
             }
-            if (n == 1) return GM_PEER_STOCK;
+            if (n == 1) { gm_probe_drain(h); return GM_PEER_STOCK; }
         }
     }
     return GM_PEER_UNKNOWN;
