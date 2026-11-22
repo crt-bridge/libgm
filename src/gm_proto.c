@@ -239,6 +239,24 @@ static int gm_send_payload(gm_handle *h, const uint8_t *payload, size_t bytes)
     const size_t mtu = (size_t)h->mtu;
     size_t       off = 0;
 
+    /* Diagnostic (gm_set_drop_tail): one picture in drop_tail_every goes out
+     * without its last datagram. Taken by the original loop, so that the
+     * dropped datagram is exactly the one a link would have lost. */
+    if (h->drop_tail_every != 0u && ++h->drop_tail_tick >= h->drop_tail_every) {
+        h->drop_tail_tick = 0u;
+        while (off < bytes) {
+            size_t chunk = gm_next_chunk(h, bytes - off);
+            if (off + chunk == bytes && off > 0u) {     /* the tail of a picture of 2+ datagrams */
+                h->drop_tail_count++;
+                return 0;
+            }
+            if (gm_socket_sendto(h->sock, payload + off, chunk, &h->to) != (int)chunk)
+                return -1;
+            off += chunk;
+        }
+        return 0;
+    }
+
     if (!h->uso_active) {
         while (off < bytes) {                                   /* original path, unchanged */
             size_t chunk = gm_next_chunk(h, bytes - off);
@@ -1544,4 +1562,18 @@ uint32_t gm_frame_dup_count(gm_handle *h)
 {
     if (!h) return 0u;
     return h->dup_count;
+}
+
+int gm_set_drop_tail(gm_handle *h, uint32_t every)
+{
+    if (!h) return -1;
+    h->drop_tail_every = every;
+    h->drop_tail_tick  = 0u;
+    return 0;
+}
+
+uint32_t gm_dropped_tails(gm_handle *h)
+{
+    if (!h) return 0u;
+    return h->drop_tail_count;
 }

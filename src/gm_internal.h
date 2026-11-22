@@ -195,6 +195,13 @@ struct gm_handle {
     uint8_t            dup_pair_open;      /* 480i: a real half-frame is waiting for its twin */
     uint32_t           dup_count;          /* frame_dup sent since open, never decreases */
 
+    /* --- Diagnostic: the last datagram of one picture in `drop_tail_every` is
+     * not sent (gm_set_drop_tail), as if a lossy link had dropped it. Zero
+     * (calloc) = off: the wire does not change. --- */
+    uint32_t           drop_tail_every;
+    uint32_t           drop_tail_tick;     /* pictures counted since the setting */
+    uint32_t           drop_tail_count;    /* tails dropped, never decreases */
+
     /* --- Outcome of the last ANNOUNCE send on this handle. Set by
      * gm_send_init and gm_send_switchres ONLY — never by the blits, audio,
      * close, or get_status. 0 = accepted by Winsock; > 0 = Winsock code; -1 =

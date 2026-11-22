@@ -410,6 +410,15 @@ int      gm_probe_peer(gm_handle *h, int tries, int timeout_ms, unsigned *rev);
  * uses). */
 uint32_t gm_frame_dup_count(gm_handle *h);
 
+/* Diagnostic, never for play: the LAST payload datagram of one picture in
+ * `every` is not sent, as if a lossy link had dropped it, so that what a
+ * receiver does with an incomplete picture can be reproduced on demand. A
+ * picture of a single datagram is never touched. 0 (default) = off, the wire
+ * does not change. Pictures only (CMD_BLIT_VSYNC and CMD_BLIT_FIELD_VSYNC
+ * payloads), never audio. gm_dropped_tails gives the running count. */
+int      gm_set_drop_tail(gm_handle *h, uint32_t every);
+uint32_t gm_dropped_tails(gm_handle *h);
+
 /* 480i half-frame, GroovyMAME path. Emits EXACTLY the same wire bytes as
  * gm_send_blit -- an 11-byte CMD_BLIT_VSYNC (0x06) header followed by its
  * chunks -- but tells libgm WHICH field parity is travelling, information
